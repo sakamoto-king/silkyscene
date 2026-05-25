@@ -1,0 +1,22 @@
+{
+  "name": "@silkysite/scene",
+  "version": "0.0.1",
+  "description": "Scene-based motion presentation engine for the web",
+  "main": "index.js",
+  "license": "MIT",
+  "author": "sakamoto-king",
+  "homepage": "https://github.com/sakamoto-king/silkyscene",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sakamoto-king/silkyscene.git"
+  },
+  "keywords": [
+    "scene",
+    "motion",
+    "presentation",
+    "animation",
+    "timeline",
+    "transition"
+  ],
+  "type": "module"
+}
