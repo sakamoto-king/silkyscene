@@ -1,1 +1,10 @@
-console.log("SilkyScene")
+/** 场景引擎导出入口。 */
+
+export { Presentation } from "./src/Presentation.js" // 演示文稿：管理元素生命周期、场景编排与状态切换
+export { Scene } from "./src/Scene.js" // 场景：保存元素状态快照的纯容器
+export { BaseElement } from "./src/BaseElement.js" // 基类：所有元素的数据基础，独立的空间对象
+export { TextElement } from "./src/elements/TextElement.js" // 文本元素：继承 BaseElement，包含文本语义
+export { ImageElement } from "./src/elements/ImageElement.js" // 图片元素：继承 BaseElement，包含图像语义
+export { ShapeElement } from "./src/elements/ShapeElement.js" // 图形元素：继承 BaseElement，包含形状语义
+export { Renderer } from "./src/Renderer.js" // 渲染器：计算布局、驱动插值、输出渲染结果
+export { Layout } from "./src/Layout.js" // 布局引擎：将相对布局描述转换为绝对坐标
