@@ -66,21 +66,68 @@ export class Renderer {
     }
 
     /**
-     * 场景切换时调用，触发布局计算与状态更新
+     * 场景切换时调用，触发布局计算与状态更新。
+     *
+     * 对于「入场元素」（本帧首次出现且有 fromState），采用两帧技术：
+     *   Phase 1（同步）: 禁用过渡，立刻将元素设置到 fromState（不可见的起始位置）
+     *   强制 reflow: 确保浏览器记录 fromState 样式
+     *   Phase 2（rAF）: 恢复过渡，动画到 toState
+     *
+     * 对于其他元素（已在上一场景中存在或无动画），直接同步应用 toState，
+     * CSS transition 自动从当前值补间到目标值。
+     *
      * @param {Presentation} presentation - 演示实例
      * @param {Scene} newScene - 新场景
      * @param {Scene|null} previousScene - 切换前场景
-    * @param {Object|null} transitionContext - 包含目标场景动画配置等上下文
+     * @param {Object|null} transitionContext - 包含目标场景动画配置等上下文
      */
     onSceneChanged(presentation, newScene, previousScene = null, transitionContext = null) {
+        // 计算导航方向
+        const fromIndex = previousScene ? presentation.scenes.indexOf(previousScene) : -1
+        const toIndex = presentation.scenes.indexOf(newScene)
+        const direction = fromIndex <= toIndex ? "forward" : "backward"
+
+        const enteringItems = []
+
         for (const element of presentation.elements) {
             const transition = presentation.resolveElementTransition(
                 element,
                 previousScene,
-                newScene
+                newScene,
+                direction
             )
-            this.applyElementState(presentation, element, transition.toState)
+            const wasInPreviousScene = Boolean(previousScene && previousScene.getState(element))
+            const isEntering = Boolean(transition.fromState && !wasInPreviousScene)
+
+            if (isEntering) {
+                // === 入场元素：Phase 1（同步）先到 fromState，禁用过渡 ===
+                const node = this.ensureElementNode(presentation, element)
+                node.style.transitionDuration = "0ms"
+                this.applyElementState(presentation, element, transition.fromState)
+                enteringItems.push({ element, toState: transition.toState })
+            } else {
+                // === 普通元素（含位移、出场）：直接应用 toState，CSS 过渡自动触发 ===
+                this.applyElementState(presentation, element, transition.toState)
+            }
         }
+
+        if (enteringItems.length === 0) {
+            return
+        }
+
+        // 强制 reflow，确保浏览器已记录 fromState
+        void presentation.content.offsetHeight
+
+        // === Phase 2（下一帧）：恢复过渡，动画到 toState ===
+        requestAnimationFrame(() => {
+            for (const { element, toState } of enteringItems) {
+                const node = this.elementToDOM.get(element)
+                if (node) {
+                    node.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+                }
+                this.applyElementState(presentation, element, toState)
+            }
+        })
     }
 
     /**

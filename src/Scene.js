@@ -118,6 +118,10 @@ export class Scene {
         if (entrance) {
             meta.entrance = entrance
         }
+        const exit = this.normalizeExit(options.exit)
+        if (exit) {
+            meta.exit = exit
+        }
         return meta
     }
 
@@ -137,18 +141,81 @@ export class Scene {
             return {
                 enabled: true,
                 from: null,
+                distance: null,
+            }
+        }
+
+        if (typeof entrance === "string") {
+            return {
+                enabled: true,
+                from: entrance,
+                distance: null,
             }
         }
 
         if (typeof entrance === "object") {
-            const from =
-                entrance.from && typeof entrance.from === "object"
-                    ? deepMerge({}, entrance.from)
-                    : null
-
+            const rawFrom = entrance.from
+            let from = null
+            if (typeof rawFrom === "string") {
+                from = rawFrom
+            } else if (rawFrom && typeof rawFrom === "object") {
+                from = deepMerge({}, rawFrom)
+            }
+            const rawDistance = Number(entrance.distance)
+            const distance = Number.isFinite(rawDistance) ? rawDistance : null
             return {
                 enabled: entrance.enabled !== false,
                 from,
+                distance,
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * 规范化 exit 语法糖。
+     * - true: 仅启用默认规则（opacity=0 淡出）
+     * - "bottom"|"top"|"left"|"right": 指定离场方向关键字
+     * - object: 可通过 to 指定显式目标态
+     * @param {boolean|string|Object} exit
+     * @returns {Object|null}
+     */
+    normalizeExit(exit) {
+        if (!exit) {
+            return null
+        }
+
+        if (exit === true) {
+            return {
+                enabled: true,
+                to: null,
+                distance: null,
+            }
+        }
+
+        if (typeof exit === "string") {
+            return {
+                enabled: true,
+                to: exit,
+                distance: null,
+            }
+        }
+
+        if (typeof exit === "object") {
+            const rawTo = exit.to
+            let to = null
+            if (typeof rawTo === "string") {
+                to = rawTo
+            } else if (rawTo && typeof rawTo === "object") {
+                to = deepMerge({}, rawTo)
+            }
+            const rawDistance = Number(exit.distance)
+            const distance = Number.isFinite(rawDistance) ? rawDistance : null
+            return {
+                enabled: exit.enabled !== false,
+                to,
+                distance,
             }
         }
 

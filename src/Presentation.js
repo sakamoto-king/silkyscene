@@ -612,14 +612,17 @@ export class Presentation {
     /**
      * 解析某个元素在场景切换中的 from/to 状态。
      *
-     * 该方法用于支持 Scene API 层的 entrance 语法糖，不会回写任何 Scene 状态。
+     * 根据导航方向和 entrance/exit 配置，计算元素的起始态与目标态，
+     * 供 Renderer 驱动动画。fromState/toState 均以场景原始状态为基础，
+     * 在其上叠加动画增量，保证布局信息始终包含在内。
      *
      * @param {BaseElement} element
      * @param {Scene|null} fromScene
      * @param {Scene} toScene
+     * @param {"forward"|"backward"} direction - 导航方向
      * @returns {{fromState: Object|null, toState: Object|null, meta: Object}}
      */
-    resolveElementTransition(element, fromScene, toScene) {
+    resolveElementTransition(element, fromScene, toScene, direction = "forward") {
         const rawFromState = fromScene ? fromScene.getState(element) : null
         const rawToState = toScene ? toScene.getState(element) : null
         const fromMeta = fromScene ? fromScene.getStateMeta(element) : null
@@ -628,17 +631,28 @@ export class Presentation {
         let fromState = rawFromState ? deepMerge({}, rawFromState) : null
         let toState = rawToState ? deepMerge({}, rawToState) : null
 
-        // 正放：元素在 toScene 首次出现，且 toScene 配置了 entrance，则构造运行时前态。
-        if (!fromState && toState && this.hasEnabledEntrance(toMeta)) {
-            const entranceFrom = this.buildEntranceBaseState(toMeta)
-            fromState = deepMerge(entranceFrom, this.pickVisibleTransitionDefaults(entranceFrom))
-        }
-
-        // 倒放：元素从 fromScene 回退到 toScene，若 toScene 缺失状态且 fromScene 配置了 entrance，
-        // 则用同一套 entrance 规则构造回退目标态，保证正反向语义对称。
-        if (fromState && !toState && this.hasEnabledEntrance(fromMeta)) {
-            const entranceFrom = this.buildEntranceBaseState(fromMeta)
-            toState = deepMerge(entranceFrom, this.pickVisibleTransitionDefaults(entranceFrom))
+        if (direction === "forward") {
+            // 正向入场：元素在 toScene 首次出现，且配置了 entrance
+            if (!rawFromState && rawToState && this.hasEnabledEntrance(toMeta)) {
+                const overrides = this._buildAnimationOverrides(toMeta.entrance, "from")
+                fromState = deepMerge(deepMerge({}, rawToState), overrides)
+            }
+            // 正向出场：元素在 toScene 中不存在，且 fromScene 配置了 exit
+            if (rawFromState && !rawToState && this.hasEnabledExit(fromMeta)) {
+                const overrides = this._buildAnimationOverrides(fromMeta.exit, "to")
+                toState = deepMerge(deepMerge({}, rawFromState), overrides)
+            }
+        } else {
+            // 反向入场：从 exit 倒放入场（元素出现但 fromScene 无此元素）
+            if (!rawFromState && rawToState && this.hasEnabledExit(toMeta)) {
+                const overrides = this._buildAnimationOverrides(toMeta.exit, "to")
+                fromState = deepMerge(deepMerge({}, rawToState), overrides)
+            }
+            // 反向出场：从 entrance 倒放出场（元素消失但 toScene 无此元素）
+            if (rawFromState && !rawToState && this.hasEnabledEntrance(fromMeta)) {
+                const overrides = this._buildAnimationOverrides(fromMeta.entrance, "from")
+                toState = deepMerge(deepMerge({}, rawFromState), overrides)
+            }
         }
 
         return {
@@ -652,6 +666,46 @@ export class Presentation {
     }
 
     /**
+     * 从 entrance/exit 元数据构建动画覆盖状态（opacity + transform 增量）。
+     * 结果用于叠加到场景原始状态上，不含布局信息。
+     * @param {Object} animMeta - entrance 或 exit 对象 { from/to, distance }
+     * @param {"from"|"to"} key
+     * @returns {Object}
+     */
+    _buildAnimationOverrides(animMeta, key) {
+        const rawValue = animMeta ? animMeta[key] : null
+        let overrides = {}
+
+        if (rawValue == null) {
+            overrides = {}
+        } else if (typeof rawValue === "string") {
+            overrides = this.buildDirectionState(rawValue, animMeta.distance)
+        } else if (typeof rawValue === "object") {
+            overrides = deepMerge({}, rawValue)
+        }
+
+        return deepMerge(overrides, this.pickVisibleTransitionDefaults(overrides))
+    }
+
+    /**
+     * 将方向关键字转换为动画状态增量。
+     * x/y 值为叠加在布局位置上的像素偏移。
+     * @param {"bottom"|"top"|"left"|"right"} keyword
+     * @param {number|null} [distance] - 偏移距离（px），默认 40
+     * @returns {Object}
+     */
+    buildDirectionState(keyword, distance) {
+        const d = (distance != null && Number.isFinite(Number(distance))) ? Number(distance) : 40
+        switch (keyword) {
+            case "bottom": return { opacity: 0, transform: { y: d } }
+            case "top":    return { opacity: 0, transform: { y: -d } }
+            case "left":   return { opacity: 0, transform: { x: -d } }
+            case "right":  return { opacity: 0, transform: { x: d } }
+            default:       return {}
+        }
+    }
+
+    /**
      * 判断 entrance 是否启用。
      * @param {Object|null} stateMeta
      * @returns {boolean}
@@ -661,33 +715,23 @@ export class Presentation {
     }
 
     /**
-     * 基于元数据构建 entrance 的基础状态。
+     * 判断 exit 是否启用。
      * @param {Object|null} stateMeta
-     * @returns {Object}
+     * @returns {boolean}
      */
-    buildEntranceBaseState(stateMeta) {
-        if (!this.hasEnabledEntrance(stateMeta)) {
-            return {}
-        }
-
-        const entrance = stateMeta.entrance
-        if (entrance.from && typeof entrance.from === "object") {
-            return deepMerge({}, entrance.from)
-        }
-
-        return {}
+    hasEnabledExit(stateMeta) {
+        return Boolean(stateMeta && stateMeta.exit && stateMeta.exit.enabled)
     }
 
     /**
-     * 仅当 entrance.from 未定义可见性时，提供默认可见性兜底。
-     * 当前约定：缺省时 opacity=0。
-     * @param {Object} entranceFrom
+     * 仅当覆盖状态未定义 opacity 时，补充默认 opacity=0。
+     * @param {Object} overrides
      * @returns {Object}
      */
-    pickVisibleTransitionDefaults(entranceFrom) {
+    pickVisibleTransitionDefaults(overrides) {
         if (
-            entranceFrom &&
-            Object.prototype.hasOwnProperty.call(entranceFrom, "opacity")
+            overrides &&
+            Object.prototype.hasOwnProperty.call(overrides, "opacity")
         ) {
             return {}
         }
