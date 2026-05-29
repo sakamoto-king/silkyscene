@@ -31,6 +31,15 @@ export class Presentation {
         navigation: {
             loop: false,
         },
+        preload: {
+            enabled: true,
+            readyThreshold: 0.8,
+            minVisibleMs: 1400,
+            showProgressBar: true,
+            barHeight: 4,
+            allowInteractionWhileLoading: true,
+            sources: [],
+        },
     }
 
     /**
@@ -54,6 +63,7 @@ export class Presentation {
         this.aspectRatio = this.normalizeAspectRatio(this.options.aspectRatio)
         this.defaultSceneTransition = this.normalizeSceneTransitionConfig(this.options.sceneTransition)
         this.navigation = this.normalizeNavigationConfig(this.options.navigation)
+        this.preload = this.normalizePreloadConfig(this.options.preload)
 
 
         // 渲染根容器
@@ -84,6 +94,17 @@ export class Presentation {
         this.cachedSceneCount = 0
         this.cachedElementCount = 0
         this.sceneStateVersionSnapshot = new WeakMap()
+
+        // 图片预加载状态
+        this.preloadTask = null
+        this.preloadReady = false
+        this.preloadStartedAt = 0
+        this.preloadFailedSources = []
+        this.preloadImageTaskCache = new Map()
+        this.preloadBarHost = null
+        this.preloadBarFill = null
+        this.preloadBarLabel = null
+        this.preloadBarHidden = false
     }
 
     /**
@@ -242,6 +263,10 @@ export class Presentation {
 
         this.ensureRenderer()
 
+        if (this.preload.enabled) {
+            this.startImagePreload()
+        }
+
         // 初始化内容层动画配置，后续切场景时会按目标场景覆盖。
         this.applySceneTransitionStyle(this.currentSceneTransition)
 
@@ -264,6 +289,7 @@ export class Presentation {
         this._unbindKeyboardNavigation()
         this._unbindTouchNavigation()
         this.unbindResizeObserver()
+        this.unmountPreloadProgressBar()
         this.currentScene = null
         if (this.renderer) {
             this.renderer.unmount()
@@ -586,6 +612,290 @@ export class Presentation {
                 threshold: Number(touchConfig.threshold) || 50,
             },
         }
+    }
+
+    /**
+     * 规范化预加载配置。
+     * @param {Object} config
+     * @returns {{enabled:boolean,readyThreshold:number,minVisibleMs:number,showProgressBar:boolean,barHeight:number,allowInteractionWhileLoading:boolean,sources:string[]}}
+     */
+    normalizePreloadConfig(config) {
+        const normalized = {
+            enabled: true,
+            readyThreshold: 0.8,
+            minVisibleMs: 1400,
+            showProgressBar: true,
+            barHeight: 4,
+            allowInteractionWhileLoading: true,
+            sources: [],
+        }
+
+        if (!config || typeof config !== "object") {
+            return normalized
+        }
+
+        normalized.enabled = config.enabled !== false
+        normalized.showProgressBar = config.showProgressBar !== false
+        normalized.allowInteractionWhileLoading = config.allowInteractionWhileLoading !== false
+
+        const readyThreshold = Number(config.readyThreshold)
+        if (Number.isFinite(readyThreshold)) {
+            normalized.readyThreshold = Math.min(Math.max(readyThreshold, 0), 1)
+        }
+
+        const minVisibleMs = Number(config.minVisibleMs)
+        if (Number.isFinite(minVisibleMs) && minVisibleMs >= 0) {
+            normalized.minVisibleMs = minVisibleMs
+        }
+
+        const barHeight = Number(config.barHeight)
+        if (Number.isFinite(barHeight) && barHeight >= 2) {
+            normalized.barHeight = barHeight
+        }
+
+        if (Array.isArray(config.sources)) {
+            normalized.sources = config.sources
+                .map((item) => String(item || "").trim())
+                .filter(Boolean)
+        }
+
+        return normalized
+    }
+
+    /**
+     * 启动图片预加载流程（默认非阻塞）。
+     */
+    startImagePreload() {
+        const allSources = this.collectPreloadImageSources()
+        if (!allSources.length) {
+            this.preloadReady = true
+            return
+        }
+
+        this.preloadStartedAt = Date.now()
+        this.preloadReady = false
+        this.preloadBarHidden = false
+        this.preloadFailedSources = []
+
+        if (this.preload.showProgressBar) {
+            this.mountPreloadProgressBar()
+            this.updatePreloadProgressBar(0)
+        }
+
+        let loaded = 0
+        let failed = 0
+        const total = allSources.length
+
+        const finalizeProgress = () => {
+            const progress = total > 0 ? (loaded + failed) / total : 1
+            this.updatePreloadProgressBar(progress)
+
+            if (!this.preloadReady && progress >= this.preload.readyThreshold) {
+                this.preloadReady = true
+                this.scheduleHidePreloadProgressBar()
+            }
+        }
+
+        this.preloadTask = Promise.all(
+            allSources.map((src) =>
+                this.preloadSingleImage(src).then((ok) => {
+                    if (ok) {
+                        loaded += 1
+                    } else {
+                        failed += 1
+                        this.preloadFailedSources.push(src)
+                    }
+                    finalizeProgress()
+                })
+            )
+        ).then(() => {
+            if (!this.preloadReady) {
+                this.preloadReady = true
+                this.scheduleHidePreloadProgressBar()
+            }
+
+            if (this.preloadFailedSources.length) {
+                console.warn(
+                    `[silkyscene preload] ${this.preloadFailedSources.length}/${total} images failed and were skipped.`
+                )
+            }
+        })
+    }
+
+    /**
+     * 收集预加载图片资源：配置 sources + ImageElement.src。
+     * @returns {string[]}
+     */
+    collectPreloadImageSources() {
+        const sources = [...this.preload.sources]
+        for (const element of this.elements) {
+            if (element && element.type === "image" && element.src) {
+                sources.push(String(element.src))
+            }
+        }
+        return [...new Set(sources.filter(Boolean))]
+    }
+
+    /**
+     * 单图预加载（带缓存）。
+     * @param {string} src
+     * @returns {Promise<boolean>}
+     */
+    preloadSingleImage(src) {
+        if (!src) {
+            return Promise.resolve(false)
+        }
+
+        if (this.preloadImageTaskCache.has(src)) {
+            return this.preloadImageTaskCache.get(src)
+        }
+
+        const task = (async () => {
+            try {
+                if (this.renderer && typeof this.renderer.predecodeImage === "function") {
+                    const ok = await this.renderer.predecodeImage(src)
+                    return Boolean(ok)
+                }
+
+                const img = new Image()
+                img.decoding = "async"
+                img.src = src
+
+                if (typeof img.decode === "function") {
+                    await img.decode()
+                    return true
+                }
+
+                await new Promise((resolve, reject) => {
+                    img.onload = () => resolve(true)
+                    img.onerror = () => reject(new Error("image load failed"))
+                })
+                return true
+            } catch {
+                return false
+            }
+        })()
+
+        this.preloadImageTaskCache.set(src, task)
+        return task
+    }
+
+    /**
+     * 挂载顶部细条进度条。
+     */
+    mountPreloadProgressBar() {
+        if (this.preloadBarHost || !this.preload.showProgressBar) {
+            return
+        }
+
+        const host = document.createElement("div")
+        host.style.position = "fixed"
+        host.style.left = "0"
+        host.style.top = "0"
+        host.style.width = "100%"
+        host.style.height = `${this.preload.barHeight}px`
+        host.style.background = "rgba(148, 163, 184, 0.28)"
+        host.style.zIndex = "99999"
+        host.style.pointerEvents = "none"
+        host.style.transition = "opacity 320ms ease"
+
+        const fill = document.createElement("div")
+        fill.style.width = "0%"
+        fill.style.height = "100%"
+        fill.style.background = "linear-gradient(90deg, #38bdf8 0%, #22d3ee 100%)"
+        fill.style.boxShadow = "0 0 10px rgba(34, 211, 238, 0.7)"
+        fill.style.transformOrigin = "left center"
+        fill.style.transition = "width 220ms ease, background 280ms ease, box-shadow 280ms ease"
+        host.appendChild(fill)
+
+        const label = document.createElement("div")
+        label.textContent = "0%"
+        label.style.position = "fixed"
+        label.style.right = "10px"
+        label.style.top = "8px"
+        label.style.padding = "2px 6px"
+        label.style.borderRadius = "999px"
+        label.style.fontSize = "10px"
+        label.style.lineHeight = "1"
+        label.style.fontWeight = "700"
+        label.style.letterSpacing = "0.04em"
+        label.style.color = "#c7f9ff"
+        label.style.background = "rgba(2, 6, 23, 0.55)"
+        label.style.border = "1px solid rgba(56, 189, 248, 0.4)"
+        label.style.backdropFilter = "blur(2px)"
+        label.style.zIndex = "100000"
+        label.style.pointerEvents = "none"
+        label.style.transition = "opacity 320ms ease, color 260ms ease, border-color 260ms ease"
+
+        document.body.appendChild(host)
+        document.body.appendChild(label)
+
+        this.preloadBarHost = host
+        this.preloadBarFill = fill
+        this.preloadBarLabel = label
+    }
+
+    /**
+     * 更新进度条。
+     * @param {number} progress
+     */
+    updatePreloadProgressBar(progress) {
+        if (!this.preloadBarHost || this.preloadBarHidden) {
+            return
+        }
+
+        const p = Math.max(0, Math.min(1, Number(progress) || 0))
+        this.preloadBarFill.style.width = `${(p * 100).toFixed(2)}%`
+        this.preloadBarLabel.textContent = `${Math.round(p * 100)}%`
+
+        if (p >= this.preload.readyThreshold) {
+            this.preloadBarFill.style.background = "linear-gradient(90deg, #22c55e 0%, #4ade80 100%)"
+            this.preloadBarFill.style.boxShadow = "0 0 10px rgba(74, 222, 128, 0.7)"
+            this.preloadBarLabel.style.color = "#dcfce7"
+            this.preloadBarLabel.style.borderColor = "rgba(74, 222, 128, 0.45)"
+        }
+    }
+
+    /**
+     * 到达阈值后按最短展示时长淡出进度条。
+     */
+    scheduleHidePreloadProgressBar() {
+        if (!this.preloadBarHost || this.preloadBarHidden) {
+            return
+        }
+
+        this.preloadBarHidden = true
+        const elapsed = Date.now() - this.preloadStartedAt
+        const waitMs = Math.max(0, this.preload.minVisibleMs - elapsed)
+
+        setTimeout(() => {
+            if (this.preloadBarHost) {
+                this.preloadBarHost.style.opacity = "0"
+            }
+            if (this.preloadBarLabel) {
+                this.preloadBarLabel.style.opacity = "0"
+            }
+        }, waitMs)
+
+        setTimeout(() => {
+            this.unmountPreloadProgressBar()
+        }, waitMs + 360)
+    }
+
+    /**
+     * 卸载进度条节点。
+     */
+    unmountPreloadProgressBar() {
+        if (this.preloadBarHost && this.preloadBarHost.parentNode) {
+            this.preloadBarHost.parentNode.removeChild(this.preloadBarHost)
+        }
+        if (this.preloadBarLabel && this.preloadBarLabel.parentNode) {
+            this.preloadBarLabel.parentNode.removeChild(this.preloadBarLabel)
+        }
+
+        this.preloadBarHost = null
+        this.preloadBarFill = null
+        this.preloadBarLabel = null
     }
 
     /**
