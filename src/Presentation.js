@@ -16,7 +16,7 @@ export class Presentation {
             overflow: "hidden",
             backgroundColor: "#333",
             width: "100vw",
-            height: "100vh",
+            height: "100dvh",
         },
         content: {
             backgroundColor: "#000",
