@@ -24,6 +24,7 @@ export class Renderer {
         this.elementToDOM = new WeakMap()
         this.nodes = new Set()
         this.presentation = null
+        this.imageDecodeCache = new Map()
     }
 
     /**
@@ -97,6 +98,18 @@ export class Renderer {
                 newScene,
                 direction
             )
+            const node = this.elementToDOM.get(element)
+            const hasRenderableState = Boolean(transition.fromState || transition.toState)
+
+            // 场景切换时跳过完全无关元素，降低全量 DOM 更新成本。
+            if (!hasRenderableState) {
+                if (node) {
+                    node.style.opacity = "0"
+                    node.style.pointerEvents = "none"
+                }
+                continue
+            }
+
             const wasInPreviousScene = Boolean(
                 previousScene && presentation.getResolvedState(previousScene, element)
             )
@@ -104,8 +117,8 @@ export class Renderer {
 
             if (isEntering) {
                 // === 入场元素：Phase 1（同步）先到 fromState，禁用过渡 ===
-                const node = this.ensureElementNode(presentation, element, presentation.content)
-                node.style.transitionDuration = "0ms"
+                const enteringNode = this.ensureElementNode(presentation, element, presentation.content)
+                enteringNode.style.transitionDuration = "0ms"
                 this.applyElementState(presentation, element, transition.fromState)
                 enteringItems.push({ element, toState: transition.toState })
             } else {
@@ -271,11 +284,11 @@ export class Renderer {
         node.style.backgroundColor = "transparent"
 
         const imageLayers = this.ensureImageLayerNodes(node)
-        imageLayers.base.src = element.src || ""
+        this.setImageNodeSource(imageLayers.base, element.src)
         imageLayers.base.alt = element.alt || ""
         imageLayers.base.style.objectFit = fit
 
-        imageLayers.highlight.src = element.src || ""
+        this.setImageNodeSource(imageLayers.highlight, element.src)
         imageLayers.highlight.alt = ""
         imageLayers.highlight.style.objectFit = fit
 
@@ -300,6 +313,7 @@ export class Renderer {
             node.textContent = ""
             base = document.createElement("img")
             base.className = "silkyscene-image-base"
+            base.decoding = "async"
             base.style.position = "absolute"
             base.style.left = "0"
             base.style.top = "0"
@@ -337,6 +351,7 @@ export class Renderer {
             windowNode.textContent = ""
             highlight = document.createElement("img")
             highlight.className = "silkyscene-image-highlight"
+            highlight.decoding = "async"
             highlight.style.position = "absolute"
             highlight.style.left = "0"
             highlight.style.top = "0"
@@ -356,6 +371,57 @@ export class Renderer {
             window: windowNode,
             highlight,
         }
+    }
+
+    /**
+     * 仅在源变化时更新图片 src，避免重复赋值触发无效开销。
+     */
+    setImageNodeSource(imageNode, src) {
+        const nextSrc = String(src || "")
+        const currentSrc = imageNode.dataset.silkysceneSrc || ""
+        if (nextSrc === currentSrc) {
+            return
+        }
+
+        imageNode.dataset.silkysceneSrc = nextSrc
+        imageNode.src = nextSrc
+
+        if (nextSrc) {
+            this.predecodeImage(nextSrc)
+        }
+    }
+
+    /**
+     * 预解码图片并缓存结果，降低首次切页卡顿。
+     */
+    predecodeImage(src) {
+        if (!src || this.imageDecodeCache.has(src)) {
+            return this.imageDecodeCache.get(src)
+        }
+
+        const decodeTask = (async () => {
+            try {
+                const img = new Image()
+                img.decoding = "async"
+                img.src = src
+
+                if (typeof img.decode === "function") {
+                    await img.decode()
+                } else {
+                    await new Promise((resolve, reject) => {
+                        img.onload = () => resolve(true)
+                        img.onerror = () => reject(new Error("image decode failed"))
+                    })
+                }
+
+                return true
+            } catch {
+                return false
+            }
+        })()
+
+        this.imageDecodeCache.set(src, decodeTask)
+        return decodeTask
     }
 
     /**
