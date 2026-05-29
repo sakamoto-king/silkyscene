@@ -193,10 +193,13 @@ export class Renderer {
                 containerHeight,
             })
         } else if (element.type === "image") {
-            this.renderImageNode(node, element)
             this.applyGenericNodeState(node, presentation, element, sceneState, {
                 containerWidth,
                 containerHeight,
+            })
+            this.renderImageNode(node, element, sceneState, {
+                containerWidth: Number(element.computed && element.computed.width) || 0,
+                containerHeight: Number(element.computed && element.computed.height) || 0,
             })
         } else if (element.type === "line") {
             this.renderLineNode(node, element, sceneState, {
@@ -249,19 +252,353 @@ export class Renderer {
     /**
      * 渲染图片节点。
      */
-    renderImageNode(node, element) {
-        let img = node.firstElementChild
-        if (!img || img.tagName !== "IMG") {
+    renderImageNode(node, element, sceneState, context = {}) {
+        const imageState = (sceneState && sceneState.image) || {}
+        const cropState = this.resolveImageCropState(
+            imageState.crop,
+            context.containerWidth,
+            context.containerHeight
+        )
+        const highlightRender = this.resolveImageHighlightRenderState(imageState.highlight, {
+            containerWidth: context.containerWidth,
+            containerHeight: context.containerHeight,
+        })
+        const dimBrightness = this.resolveImageDimBrightness(imageState.filter)
+        const baseBrightness = this.resolveImageBaseBrightness(highlightRender, dimBrightness)
+        const fit = imageState.fit || element.objectFit || element.fit || "cover"
+
+        node.style.overflow = "hidden"
+        node.style.backgroundColor = "transparent"
+
+        const imageLayers = this.ensureImageLayerNodes(node)
+        imageLayers.base.src = element.src || ""
+        imageLayers.base.alt = element.alt || ""
+        imageLayers.base.style.objectFit = fit
+
+        imageLayers.highlight.src = element.src || ""
+        imageLayers.highlight.alt = ""
+        imageLayers.highlight.style.objectFit = fit
+
+        this.applyImageCropToLayer(imageLayers.base, cropState)
+        this.applyImageCropToLayer(imageLayers.highlight, cropState)
+
+        imageLayers.base.style.filter = `brightness(${baseBrightness})`
+        imageLayers.highlight.style.filter = "none"
+
+        this.applyImageHighlightState(imageLayers.window, imageLayers.highlight, highlightRender, {
+            containerWidth: context.containerWidth,
+            containerHeight: context.containerHeight,
+        })
+    }
+
+    /**
+     * 确保图片节点结构：暗图层 + 高亮窗图层。
+     */
+    ensureImageLayerNodes(node) {
+        let base = node.querySelector(".silkyscene-image-base")
+        if (!base || base.tagName !== "IMG") {
             node.textContent = ""
-            img = document.createElement("img")
-            img.style.display = "block"
-            img.style.width = "100%"
-            img.style.height = "100%"
-            node.appendChild(img)
+            base = document.createElement("img")
+            base.className = "silkyscene-image-base"
+            base.style.position = "absolute"
+            base.style.left = "0"
+            base.style.top = "0"
+            base.style.width = "100%"
+            base.style.height = "100%"
+            base.style.display = "block"
+            base.style.transformOrigin = "50% 50%"
+            base.style.willChange = "transform, filter"
+            base.style.transitionProperty = "transform, filter"
+            base.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+            base.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            node.appendChild(base)
         }
-        img.src = element.src || ""
-        img.alt = element.alt || ""
-        img.style.objectFit = element.objectFit || element.fit || "cover"
+
+        let windowNode = node.querySelector(".silkyscene-image-highlight-window")
+        if (!windowNode) {
+            windowNode = document.createElement("div")
+            windowNode.className = "silkyscene-image-highlight-window"
+            windowNode.style.position = "absolute"
+            windowNode.style.left = "0"
+            windowNode.style.top = "0"
+            windowNode.style.width = "0"
+            windowNode.style.height = "0"
+            windowNode.style.display = "none"
+            windowNode.style.overflow = "hidden"
+            windowNode.style.pointerEvents = "none"
+            windowNode.style.transitionProperty = "left, top, width, height, border-radius, opacity"
+            windowNode.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+            windowNode.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            node.appendChild(windowNode)
+        }
+
+        let highlight = windowNode.querySelector(".silkyscene-image-highlight")
+        if (!highlight || highlight.tagName !== "IMG") {
+            windowNode.textContent = ""
+            highlight = document.createElement("img")
+            highlight.className = "silkyscene-image-highlight"
+            highlight.style.position = "absolute"
+            highlight.style.left = "0"
+            highlight.style.top = "0"
+            highlight.style.width = "100%"
+            highlight.style.height = "100%"
+            highlight.style.display = "block"
+            highlight.style.transformOrigin = "50% 50%"
+            highlight.style.willChange = "left, top, width, height, transform"
+            highlight.style.transitionProperty = "left, top, width, height, transform"
+            highlight.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+            highlight.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            windowNode.appendChild(highlight)
+        }
+
+        return {
+            base,
+            window: windowNode,
+            highlight,
+        }
+    }
+
+    /**
+     * 解析图片裁剪状态并约束偏移，避免露出黑边。
+     */
+    resolveImageCropState(cropState = {}, containerWidth = 0, containerHeight = 0) {
+        const width = Math.max(1, Number(containerWidth) || 0)
+        const height = Math.max(1, Number(containerHeight) || 0)
+        const rawScale = Number(cropState && cropState.scale)
+        const scale = Number.isFinite(rawScale) ? Math.max(1, rawScale) : 1
+
+        const requestedOffsetX = this.parseCoordinate(
+            cropState && cropState.offsetX != null ? cropState.offsetX : 0,
+            width
+        )
+        const requestedOffsetY = this.parseCoordinate(
+            cropState && cropState.offsetY != null ? cropState.offsetY : 0,
+            height
+        )
+
+        const maxOffsetX = (width * (scale - 1)) / 2
+        const maxOffsetY = (height * (scale - 1)) / 2
+
+        const offsetX = this.clamp(requestedOffsetX, -maxOffsetX, maxOffsetX)
+        const offsetY = this.clamp(requestedOffsetY, -maxOffsetY, maxOffsetY)
+
+        return {
+            scale,
+            offsetX,
+            offsetY,
+        }
+    }
+
+    /**
+     * 将裁剪变换应用到图片图层。
+     */
+    applyImageCropToLayer(imageNode, cropState) {
+        const scale = Number(cropState && cropState.scale) || 1
+        const offsetX = Number(cropState && cropState.offsetX) || 0
+        const offsetY = Number(cropState && cropState.offsetY) || 0
+        imageNode.style.transform = `translate3d(${offsetX}px, ${offsetY}px, 0) scale(${scale})`
+    }
+
+    /**
+     * 解析暗化亮度参数。
+     */
+    resolveImageDimBrightness(filterState = {}) {
+        const raw = Number(filterState && filterState.dimBrightness)
+        if (!Number.isFinite(raw)) {
+            return 1
+        }
+        return this.clamp(raw, 0, 1)
+    }
+
+    /**
+     * 解析高亮渲染状态。
+     */
+    resolveImageHighlightRenderState(highlightState = {}, context = {}) {
+        const containerWidth = Math.max(1, Number(context.containerWidth) || 0)
+        const containerHeight = Math.max(1, Number(context.containerHeight) || 0)
+        const sizeBase = this.getSizeBase(containerWidth, containerHeight)
+
+        const stage = this.resolveHighlightStage(highlightState)
+        const progress = this.resolveHighlightProgress(stage, highlightState)
+
+        const requestedX = this.parseCoordinate(
+            highlightState && highlightState.x != null ? highlightState.x : "0%",
+            containerWidth
+        )
+        const requestedY = this.parseCoordinate(
+            highlightState && highlightState.y != null ? highlightState.y : "0%",
+            containerHeight
+        )
+        const requestedWidth = this.parseCoordinate(
+            highlightState && highlightState.width != null ? highlightState.width : "100%",
+            containerWidth
+        )
+        const requestedHeight = this.parseCoordinate(
+            highlightState && highlightState.height != null ? highlightState.height : "100%",
+            containerHeight
+        )
+
+        const targetX = this.clamp(requestedX, 0, containerWidth)
+        const targetY = this.clamp(requestedY, 0, containerHeight)
+        const targetWidth = this.clamp(requestedWidth, 0, containerWidth - targetX)
+        const targetHeight = this.clamp(requestedHeight, 0, containerHeight - targetY)
+        const radius = parsePercentSize(
+            highlightState && highlightState.radius != null ? highlightState.radius : "0%",
+            sizeBase,
+            "ImageElement.highlight.radius"
+        )
+
+        const fullRect = {
+            x: 0,
+            y: 0,
+            width: containerWidth,
+            height: containerHeight,
+        }
+        const targetRect = {
+            x: targetX,
+            y: targetY,
+            width: targetWidth,
+            height: targetHeight,
+        }
+
+        let rect = targetRect
+        let opacity = Number(highlightState && highlightState.opacity)
+        if (!Number.isFinite(opacity)) {
+            opacity = 1
+        }
+        opacity = this.clamp(opacity, 0, 1)
+
+        if (stage === "hidden") {
+            rect = fullRect
+            opacity = 0
+        } else if (stage === "entering") {
+            rect = this.interpolateRect(fullRect, targetRect, progress)
+        } else if (stage === "exiting") {
+            rect = targetRect
+            if (!(highlightState && Object.prototype.hasOwnProperty.call(highlightState, "opacity"))) {
+                opacity = this.clamp(1 - progress, 0, 1)
+            }
+        }
+
+        return {
+            stage,
+            progress,
+            rect,
+            radius: Math.max(0, radius),
+            opacity,
+        }
+    }
+
+    /**
+     * 基于高亮阶段解析底图亮度。
+     */
+    resolveImageBaseBrightness(highlightRender, dimBrightness) {
+        if (!highlightRender) {
+            return 1
+        }
+
+        if (highlightRender.stage === "entering") {
+            return this.lerp(1, dimBrightness, highlightRender.progress)
+        }
+
+        if (highlightRender.stage === "shown") {
+            return dimBrightness
+        }
+
+        if (highlightRender.stage === "exiting") {
+            return this.lerp(dimBrightness, 1, highlightRender.progress)
+        }
+
+        return 1
+    }
+
+    /**
+     * 应用高亮窗状态（支持位置、尺寸与透明度动画）。
+     */
+    applyImageHighlightState(windowNode, highlightNode, highlightRender, context = {}) {
+        const containerWidth = Math.max(1, Number(context.containerWidth) || 0)
+        const containerHeight = Math.max(1, Number(context.containerHeight) || 0)
+
+        if (!highlightRender) {
+            windowNode.style.display = "none"
+            return
+        }
+
+        windowNode.style.display = "block"
+        windowNode.style.left = `${highlightRender.rect.x}px`
+        windowNode.style.top = `${highlightRender.rect.y}px`
+        windowNode.style.width = `${highlightRender.rect.width}px`
+        windowNode.style.height = `${highlightRender.rect.height}px`
+        windowNode.style.borderRadius = `${highlightRender.radius}px`
+        windowNode.style.opacity = `${highlightRender.opacity}`
+
+        // 高亮图层始终保持与底图一致的绝对尺寸与缩放基准，
+        // 通过负偏移把同一内容坐标对齐到高亮窗口。
+        highlightNode.style.width = `${containerWidth}px`
+        highlightNode.style.height = `${containerHeight}px`
+        highlightNode.style.left = `${-highlightRender.rect.x}px`
+        highlightNode.style.top = `${-highlightRender.rect.y}px`
+    }
+
+    /**
+     * 解析高亮阶段。
+     */
+    resolveHighlightStage(highlightState = {}) {
+        const stage = typeof (highlightState && highlightState.stage) === "string"
+            ? highlightState.stage.trim().toLowerCase()
+            : ""
+
+        if (stage === "hidden" || stage === "entering" || stage === "shown" || stage === "exiting") {
+            return stage
+        }
+
+        if (highlightState && highlightState.enabled === true) {
+            return "shown"
+        }
+
+        return "hidden"
+    }
+
+    /**
+     * 解析高亮阶段进度。
+     */
+    resolveHighlightProgress(stage, highlightState = {}) {
+        const raw = Number(highlightState && highlightState.progress)
+        if (Number.isFinite(raw)) {
+            return this.clamp(raw, 0, 1)
+        }
+
+        if (stage === "hidden") {
+            return 0
+        }
+
+        return 1
+    }
+
+    /**
+     * 线性插值矩形。
+     */
+    interpolateRect(fromRect, toRect, progress) {
+        return {
+            x: this.lerp(fromRect.x, toRect.x, progress),
+            y: this.lerp(fromRect.y, toRect.y, progress),
+            width: this.lerp(fromRect.width, toRect.width, progress),
+            height: this.lerp(fromRect.height, toRect.height, progress),
+        }
+    }
+
+    /**
+     * 线性插值。
+     */
+    lerp(from, to, progress) {
+        return from + (to - from) * progress
+    }
+
+    /**
+     * 数值钳制。
+     */
+    clamp(value, min, max) {
+        return Math.min(Math.max(value, min), max)
     }
 
     /**
@@ -491,6 +828,13 @@ export class Renderer {
             layout,
         })
         element.computed = computed
+
+        if (computed.width > 0) {
+            node.style.width = `${computed.width}px`
+        }
+        if (computed.height > 0) {
+            node.style.height = `${computed.height}px`
+        }
 
         const rect = node.getBoundingClientRect()
         const anchorX = Number(layout.anchorX || 0)
