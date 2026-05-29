@@ -72,6 +72,14 @@ In the future, it may evolve into a full presentation engine, or remain a proof-
 npm install @silkysite/scene
 ```
 
+## Docs / 文档
+
+- `docs/运行时对象与状态模型.md`：对象模型、场景继承、响应式尺寸规范
+- `docs/场景入场语法糖提案.md`：entrance/exit/direction 语义与 distance 规则
+- `docs/两帧渲染机制.md`：入场动画两帧执行流程
+- `docs/LineElement与ArrowElement设计.md`：纯 DOM 线段与组合箭头设计
+- `docs/ShapeElement设计与矩形实现.md`：rect/circle 图形、描边、圆角与场景状态设计
+
 ## License / 许可证
 
 MIT

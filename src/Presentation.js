@@ -77,6 +77,13 @@ export class Presentation {
 
         // 默认渲染器
         this.renderer = null
+
+        // 场景最终态缓存（resolved state/meta）
+        this.resolvedSceneCache = new Map()
+        this.resolvedCacheDirty = true
+        this.cachedSceneCount = 0
+        this.cachedElementCount = 0
+        this.sceneStateVersionSnapshot = new WeakMap()
     }
 
     /**
@@ -226,6 +233,9 @@ export class Presentation {
     start() {
         this.initContainerStyle()
 
+        // 在演示开始前统一预计算场景最终态，切换时直接读取缓存。
+        this.ensureResolvedSceneCache()
+
         if (!this.content.parentNode) {
             this.container.appendChild(this.content)
         }
@@ -373,6 +383,7 @@ export class Presentation {
         }
 
         this.elements.push(element)
+        this.markResolvedCacheDirty()
     }
 
     /**
@@ -383,6 +394,7 @@ export class Presentation {
         const index = this.elements.indexOf(element)
         if (index !== -1) {
             this.elements.splice(index, 1)
+            this.markResolvedCacheDirty()
             if (this.renderer) {
                 this.renderer.removeElement(element)
             }
@@ -398,6 +410,7 @@ export class Presentation {
             throw new Error("场景必须是有效的 Scene 实例")
         }
         this.scenes.push(scene)
+        this.markResolvedCacheDirty()
     }
 
     /**
@@ -408,6 +421,7 @@ export class Presentation {
         if (this.scenes.indexOf(scene) === -1) {
             throw new Error("指定的场景不属于此演示")
         }
+        this.ensureResolvedSceneCache()
         const previousScene = this.currentScene
         const transitionConfig = this.resolveSceneTransitionConfig(scene)
         this.currentSceneTransition = transitionConfig
@@ -600,7 +614,7 @@ export class Presentation {
             return
         }
 
-        this.content.style.transitionProperty = "transform, opacity"
+        this.content.style.transitionProperty = "transform, opacity, background-color, color, width, height, border-radius, border-width"
         this.content.style.transitionDuration = `${transitionConfig.duration}ms`
         this.content.style.transitionTimingFunction = transitionConfig.easing
 
@@ -623,10 +637,10 @@ export class Presentation {
      * @returns {{fromState: Object|null, toState: Object|null, meta: Object}}
      */
     resolveElementTransition(element, fromScene, toScene, direction = "forward") {
-        const rawFromState = fromScene ? fromScene.getState(element) : null
-        const rawToState = toScene ? toScene.getState(element) : null
-        const fromMeta = fromScene ? fromScene.getStateMeta(element) : null
-        const toMeta = toScene ? toScene.getStateMeta(element) : null
+        const rawFromState = fromScene ? this.getResolvedState(fromScene, element) : null
+        const rawToState = toScene ? this.getResolvedState(toScene, element) : null
+        const fromMeta = fromScene ? this.getResolvedMeta(fromScene, element) : null
+        const toMeta = toScene ? this.getResolvedMeta(toScene, element) : null
 
         let fromState = rawFromState ? deepMerge({}, rawFromState) : null
         let toState = rawToState ? deepMerge({}, rawToState) : null
@@ -689,19 +703,19 @@ export class Presentation {
 
     /**
      * 将方向关键字转换为动画状态增量。
-     * x/y 值为叠加在布局位置上的像素偏移。
+     * x/y 值为叠加在布局位置上的偏移，第一版使用百分比字符串（相对短边）。
      * @param {"bottom"|"top"|"left"|"right"} keyword
-     * @param {number|null} [distance] - 偏移距离（px），默认 40
+     * @param {string|null} [distance] - 偏移距离（百分比），默认 "4%"
      * @returns {Object}
      */
     buildDirectionState(keyword, distance) {
-        const d = (distance != null && Number.isFinite(Number(distance))) ? Number(distance) : 40
+        const d = distance || "4%"
         switch (keyword) {
             case "bottom": return { opacity: 0, transform: { y: d } }
-            case "top":    return { opacity: 0, transform: { y: -d } }
-            case "left":   return { opacity: 0, transform: { x: -d } }
-            case "right":  return { opacity: 0, transform: { x: d } }
-            default:       return {}
+            case "top": return { opacity: 0, transform: { y: -d } }
+            case "left": return { opacity: 0, transform: { x: -d } }
+            case "right": return { opacity: 0, transform: { x: d } }
+            default: return {}
         }
     }
 
@@ -739,5 +753,166 @@ export class Presentation {
         return {
             opacity: 0,
         }
+    }
+
+    /**
+     * 标记场景最终态缓存失效。
+     */
+    markResolvedCacheDirty() {
+        this.resolvedCacheDirty = true
+    }
+
+    /**
+     * 判断缓存是否过期。
+     * 触发条件：元素数量/场景数量变更，或场景状态版本号变化。
+     * @returns {boolean}
+     */
+    isResolvedCacheOutdated() {
+        if (this.resolvedCacheDirty) {
+            return true
+        }
+
+        if (this.cachedSceneCount !== this.scenes.length) {
+            return true
+        }
+
+        if (this.cachedElementCount !== this.elements.length) {
+            return true
+        }
+
+        for (const scene of this.scenes) {
+            const currentVersion =
+                scene && typeof scene.getStateVersion === "function"
+                    ? scene.getStateVersion()
+                    : 0
+            const snapshotVersion = this.sceneStateVersionSnapshot.get(scene)
+            if (snapshotVersion !== currentVersion) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    /**
+     * 确保场景最终态缓存可用。
+     */
+    ensureResolvedSceneCache() {
+        if (!this.isResolvedCacheOutdated()) {
+            return
+        }
+
+        this.rebuildResolvedSceneCache()
+    }
+
+    /**
+     * 重建场景最终态缓存。
+     * 规则：
+     * 1. 当前场景未声明元素时，继承上一场景最终态。
+     * 2. Scene.removeState(element) 会写入显式移除标记，阻断继承。
+     * 3. 当前场景 setState 会覆盖继承结果；meta 同步覆盖。
+     */
+    rebuildResolvedSceneCache() {
+        const cache = new Map()
+        let previousResolvedStates = new Map()
+        let previousResolvedMeta = new Map()
+
+        for (const scene of this.scenes) {
+            const resolvedStates = new Map()
+            const resolvedMeta = new Map()
+
+            for (const [elementId, prevState] of previousResolvedStates.entries()) {
+                resolvedStates.set(elementId, deepMerge({}, prevState))
+            }
+
+            for (const [elementId, prevMeta] of previousResolvedMeta.entries()) {
+                resolvedMeta.set(elementId, deepMerge({}, prevMeta))
+            }
+
+            for (const element of this.elements) {
+                const elementId = element.id
+                const isRemoved =
+                    scene && typeof scene.isStateRemoved === "function"
+                        ? scene.isStateRemoved(element)
+                        : false
+
+                if (isRemoved) {
+                    resolvedStates.delete(elementId)
+                    resolvedMeta.delete(elementId)
+                    continue
+                }
+
+                const explicitState = scene.getState(element)
+                if (!explicitState) {
+                    continue
+                }
+
+                resolvedStates.set(elementId, deepMerge({}, explicitState))
+
+                const explicitMeta = scene.getStateMeta(element)
+                resolvedMeta.set(elementId, deepMerge({}, explicitMeta || {}))
+            }
+
+            cache.set(scene, {
+                states: resolvedStates,
+                meta: resolvedMeta,
+            })
+
+            previousResolvedStates = resolvedStates
+            previousResolvedMeta = resolvedMeta
+
+            const stateVersion =
+                scene && typeof scene.getStateVersion === "function"
+                    ? scene.getStateVersion()
+                    : 0
+            this.sceneStateVersionSnapshot.set(scene, stateVersion)
+        }
+
+        this.resolvedSceneCache = cache
+        this.cachedSceneCount = this.scenes.length
+        this.cachedElementCount = this.elements.length
+        this.resolvedCacheDirty = false
+    }
+
+    /**
+     * 获取元素在指定场景的最终态（已应用继承与移除规则）。
+     * @param {Scene|null} scene
+     * @param {BaseElement} element
+     * @returns {Object|null}
+     */
+    getResolvedState(scene, element) {
+        if (!scene || !element || !element.id) {
+            return null
+        }
+
+        this.ensureResolvedSceneCache()
+        const sceneCache = this.resolvedSceneCache.get(scene)
+        if (!sceneCache) {
+            return null
+        }
+
+        const state = sceneCache.states.get(element.id)
+        return state ? deepMerge({}, state) : null
+    }
+
+    /**
+     * 获取元素在指定场景的最终元数据（已应用继承与移除规则）。
+     * @param {Scene|null} scene
+     * @param {BaseElement} element
+     * @returns {Object|null}
+     */
+    getResolvedMeta(scene, element) {
+        if (!scene || !element || !element.id) {
+            return null
+        }
+
+        this.ensureResolvedSceneCache()
+        const sceneCache = this.resolvedSceneCache.get(scene)
+        if (!sceneCache) {
+            return null
+        }
+
+        const meta = sceneCache.meta.get(element.id)
+        return meta ? deepMerge({}, meta) : null
     }
 }

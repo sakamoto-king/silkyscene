@@ -1,4 +1,5 @@
 import { deepMerge } from "./utils/deepMerge.js"
+import { normalizeDistancePercent } from "./utils/size.js"
 
 /**
  * 场景。
@@ -22,12 +23,19 @@ export class Scene {
         // 键为元素 ID，值为 setState 的附加语义配置（如 entrance）
         this.stateMeta = {}
 
+        // 元素显式移除标记（tombstone）
+        // 被标记的元素不会继承上一场景最终态
+        this.removedStateIds = new Set()
+
         // 元素 ID 列表，用于快速迭代顺序
         this.elementIds = []
 
         // 场景级切换动画配置（仅在“切换到本场景”时生效）
         // 支持字段：duration(ms)、easing(css timing-function)
         this.transition = this.normalizeTransition(options.transition)
+
+        // 场景状态版本号（仅用于状态继承缓存失效判断）
+        this.stateVersion = 0
     }
 
     /**
@@ -65,9 +73,11 @@ export class Scene {
         }
         this.states[element.id] = state
         this.stateMeta[element.id] = this.normalizeStateMeta(options)
+        this.removedStateIds.delete(element.id)
         if (!this.elementIds.includes(element.id)) {
             this.elementIds.push(element.id)
         }
+        this.stateVersion += 1
     }
 
     /**
@@ -104,7 +114,30 @@ export class Scene {
         }
         delete this.states[element.id]
         delete this.stateMeta[element.id]
+        this.removedStateIds.add(element.id)
         this.elementIds = this.elementIds.filter(id => id !== element.id)
+        this.stateVersion += 1
+    }
+
+    /**
+     * 判断某元素在当前场景是否被显式移除（阻断继承）。
+     * @param {BaseElement} element
+     * @returns {boolean}
+     */
+    isStateRemoved(element) {
+        if (!element || !element.id) {
+            return false
+        }
+
+        return this.removedStateIds.has(element.id)
+    }
+
+    /**
+     * 获取场景状态版本号。
+     * @returns {number}
+     */
+    getStateVersion() {
+        return this.stateVersion
     }
 
     /**
@@ -141,7 +174,7 @@ export class Scene {
             return {
                 enabled: true,
                 from: null,
-                distance: null,
+                distance: "4%",
             }
         }
 
@@ -149,7 +182,7 @@ export class Scene {
             return {
                 enabled: true,
                 from: entrance,
-                distance: null,
+                distance: "4%",
             }
         }
 
@@ -161,8 +194,10 @@ export class Scene {
             } else if (rawFrom && typeof rawFrom === "object") {
                 from = deepMerge({}, rawFrom)
             }
-            const rawDistance = Number(entrance.distance)
-            const distance = Number.isFinite(rawDistance) ? rawDistance : null
+            const distance = normalizeDistancePercent(
+                entrance.distance ?? "4%",
+                "entrance.distance"
+            )
             return {
                 enabled: entrance.enabled !== false,
                 from,
@@ -190,7 +225,7 @@ export class Scene {
             return {
                 enabled: true,
                 to: null,
-                distance: null,
+                distance: "4%",
             }
         }
 
@@ -198,7 +233,7 @@ export class Scene {
             return {
                 enabled: true,
                 to: exit,
-                distance: null,
+                distance: "4%",
             }
         }
 
@@ -210,8 +245,10 @@ export class Scene {
             } else if (rawTo && typeof rawTo === "object") {
                 to = deepMerge({}, rawTo)
             }
-            const rawDistance = Number(exit.distance)
-            const distance = Number.isFinite(rawDistance) ? rawDistance : null
+            const distance = normalizeDistancePercent(
+                exit.distance ?? "4%",
+                "exit.distance"
+            )
             return {
                 enabled: exit.enabled !== false,
                 to,
