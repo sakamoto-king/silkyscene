@@ -1,3 +1,11 @@
+let ELEMENT_ID_COUNTER = 0
+const ELEMENT_ID_SEED = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+
+function createElementId() {
+    ELEMENT_ID_COUNTER += 1
+    return `elem_${ELEMENT_ID_SEED}_${ELEMENT_ID_COUNTER.toString(36)}`
+}
+
 /**
  * 元素基类。
  *
@@ -7,13 +15,17 @@
 export class BaseElement {
     /**
      * @param {Object} options
-     * @param {string} [options.id] - 元素唯一标识
      * @param {string} [options.name] - 元素名称
      * @param {string} [options.type="element"] - 元素类型
      */
     constructor(options = {}) {
         // 第一层：基础信息
-        this.id = options.id || null
+        Object.defineProperty(this, "id", {
+            value: createElementId(),
+            writable: false,
+            configurable: false,
+            enumerable: true,
+        })
         this.name = options.name || ""
         this.type = options.type || "element"
         this.visible = options.visible !== undefined ? options.visible : true

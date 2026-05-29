@@ -21,15 +21,60 @@ export class Layout {
      * @param {Object} sceneState - 该元素在当前 Scene 中的状态覆盖
      * @returns {Object} 计算后的 { x, y, width, height }
      */
-    static resolve(element, sceneState) {
-        // 当前为占位接口，由应用层实现或后续迭代补充
-        // 返回格式示例：
+    static resolve(element, sceneState, context = {}) {
+        const mergedLayout =
+            (context && context.layout) ||
+            {
+                ...(element.layout || {}),
+                ...((sceneState && sceneState.layout) || {}),
+            }
+
+        const containerWidth = Number(context.containerWidth || 0)
+        const containerHeight = Number(context.containerHeight || 0)
+
+        const x = Layout.toPixels(mergedLayout.left, containerWidth)
+        const y = Layout.toPixels(mergedLayout.top, containerHeight)
+
         return {
-            x: 0,
-            y: 0,
-            width: element.layout.width || 100,
-            height: element.layout.height || 100,
+            x,
+            y,
+            width: Layout.toPixels(mergedLayout.width, containerWidth),
+            height: Layout.toPixels(mergedLayout.height, containerHeight),
         }
+    }
+
+    /**
+     * 将百分比或数值转换为像素。
+     * @param {number|string} value
+     * @param {number} total
+     * @returns {number}
+     */
+    static toPixels(value, total) {
+        if (typeof value === "number") {
+            return value
+        }
+
+        if (typeof value === "string") {
+            const text = value.trim()
+
+            if (!text || text === "auto") {
+                return 0
+            }
+
+            if (text.endsWith("%")) {
+                const percent = Number.parseFloat(text)
+                if (Number.isFinite(percent)) {
+                    return (percent / 100) * total
+                }
+            }
+
+            const numeric = Number(text)
+            if (Number.isFinite(numeric)) {
+                return numeric
+            }
+        }
+
+        return 0
     }
 }
 

@@ -1,3 +1,5 @@
+import { deepMerge } from "./utils/deepMerge.js"
+
 /**
  * 场景。
  *
@@ -9,27 +11,60 @@ export class Scene {
     /**
      * @param {string} name - 场景名称
      */
-    constructor(name) {
+    constructor(name, options = {}) {
         this.name = name
-        
+
         // 元素状态存储
         // 键为元素 ID，值为该元素在当前场景的状态
         this.states = {}
-        
+
+        // 元素状态元数据
+        // 键为元素 ID，值为 setState 的附加语义配置（如 entrance）
+        this.stateMeta = {}
+
         // 元素 ID 列表，用于快速迭代顺序
         this.elementIds = []
+
+        // 场景级切换动画配置（仅在“切换到本场景”时生效）
+        // 支持字段：duration(ms)、easing(css timing-function)
+        this.transition = this.normalizeTransition(options.transition)
+    }
+
+    /**
+     * 设置当前场景的切换动画配置。
+     * 配置含义：切换到该场景时的动画配置。
+     * @param {Object|null} transition
+     * @returns {Scene}
+     */
+    setTransition(transition) {
+        this.transition = this.normalizeTransition(transition)
+        return this
+    }
+
+    /**
+     * 获取当前场景动画配置。
+     * @returns {Object|null}
+     */
+    getTransition() {
+        if (!this.transition) {
+            return null
+        }
+        return deepMerge({}, this.transition)
     }
 
     /**
      * 为某个元素设置在当前场景的状态
      * @param {BaseElement} element - 元素实例
      * @param {Object} state - 状态对象 { layout, transform, opacity, visible, ... }
+     * @param {Object} [options] - 语义扩展配置
+     * @param {boolean|Object} [options.entrance] - 入场语法糖；true 表示启用默认规则
      */
-    setState(element, state) {
+    setState(element, state, options = {}) {
         if (!element || !element.id) {
             throw new Error("元素必须有有效的 id")
         }
         this.states[element.id] = state
+        this.stateMeta[element.id] = this.normalizeStateMeta(options)
         if (!this.elementIds.includes(element.id)) {
             this.elementIds.push(element.id)
         }
@@ -48,6 +83,18 @@ export class Scene {
     }
 
     /**
+     * 获取某个元素在当前场景的状态元数据
+     * @param {BaseElement} element
+     * @returns {Object|null}
+     */
+    getStateMeta(element) {
+        if (!element || !element.id) {
+            return null
+        }
+        return this.stateMeta[element.id] || null
+    }
+
+    /**
      * 移除某个元素的状态
      * @param {BaseElement} element
      */
@@ -56,6 +103,88 @@ export class Scene {
             return
         }
         delete this.states[element.id]
+        delete this.stateMeta[element.id]
         this.elementIds = this.elementIds.filter(id => id !== element.id)
+    }
+
+    /**
+     * 规范化状态元数据，确保运行时可以稳定消费。
+     * @param {Object} options
+     * @returns {Object}
+     */
+    normalizeStateMeta(options) {
+        const meta = {}
+        const entrance = this.normalizeEntrance(options.entrance)
+        if (entrance) {
+            meta.entrance = entrance
+        }
+        return meta
+    }
+
+    /**
+     * 规范化 entrance 语法糖。
+     * - true: 仅启用默认规则（当前场景首次出现时，前态缺省则 opacity=0）
+     * - object: 可通过 from 指定显式前态
+     * @param {boolean|Object} entrance
+     * @returns {Object|null}
+     */
+    normalizeEntrance(entrance) {
+        if (!entrance) {
+            return null
+        }
+
+        if (entrance === true) {
+            return {
+                enabled: true,
+                from: null,
+            }
+        }
+
+        if (typeof entrance === "object") {
+            const from =
+                entrance.from && typeof entrance.from === "object"
+                    ? deepMerge({}, entrance.from)
+                    : null
+
+            return {
+                enabled: entrance.enabled !== false,
+                from,
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * 规范化场景级动画配置。
+     * @param {Object|null} transition
+     * @returns {Object|null}
+     */
+    normalizeTransition(transition) {
+        if (!transition || typeof transition !== "object") {
+            return null
+        }
+
+        const normalized = {}
+
+        if (Object.prototype.hasOwnProperty.call(transition, "duration")) {
+            const duration = Number(transition.duration)
+            if (Number.isFinite(duration) && duration >= 0) {
+                normalized.duration = duration
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(transition, "easing")) {
+            const easing = String(transition.easing || "").trim()
+            if (easing) {
+                normalized.easing = easing
+            }
+        }
+
+        if (!Object.keys(normalized).length) {
+            return null
+        }
+
+        return normalized
     }
 }
