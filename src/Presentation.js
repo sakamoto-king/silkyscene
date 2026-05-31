@@ -33,7 +33,7 @@ export class Presentation {
         },
         preload: {
             enabled: true,
-            readyThreshold: 0.8,
+            readyThreshold: 1,
             minVisibleMs: 1400,
             showProgressBar: true,
             barHeight: 4,
@@ -622,7 +622,7 @@ export class Presentation {
     normalizePreloadConfig(config) {
         const normalized = {
             enabled: true,
-            readyThreshold: 0.8,
+            readyThreshold: 1,
             minVisibleMs: 1400,
             showProgressBar: true,
             barHeight: 4,
