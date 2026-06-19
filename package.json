@@ -18,5 +18,8 @@
     "timeline",
     "transition"
   ],
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "test": "node __tests__/scene-v2.test.js"
+  }
 }
