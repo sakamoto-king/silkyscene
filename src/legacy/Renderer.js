@@ -1,22 +1,47 @@
+/**
+ * @deprecated
+ * 这是旧版 DOM 渲染路径（Renderer/Layout）。仅用于兼容现有运行逻辑。
+ */
+
 import { Layout } from "./Layout.js"
-import { parseMotionOffset, parsePercentSize } from "./utils/size.js"
+import { parseMotionOffset, parsePercentSize } from "../utils/size.js"
 
 /**
- * 渲染器。
+ * Renderer（渲染执行器）。
  *
- * 负责协调布局计算、变换插值、DOM 更新。
- * 在场景切换时驱动 Layout 重算，在帧循环中驱动动画插值。
- * 
- * 职责：
- * - 在场景切换时读取新状态、调用 Layout 计算、标记 dirty
- * - 在帧循环中执行插值计算
- * - 通过 transform 样式更新 DOM（不使用 left/top）
- * - 管理 Element 与 DOM 的映射（WeakMap 等）
- * 
- * 不做的事：
- * - 不修改 Element 本体的 layout、transform 等属性
- * - 不存储 DOM 引用在 Element 中
- * - 不进行复杂的动画曲线（仅线性插值或简单三次贝塞尔）
+ * Renderer 的核心定位：
+ * - 只负责“执行渲染计划”，把状态写到 DOM（style/transform/opacity），并稳定触发 CSS transition。
+ * - 不负责“推导语义”（方向、delay 镜像、from/to 解析等），这些应由 Presentation 生成并下发。
+ *
+ * 职责
+ * - 管理 Element ↔ DOM 的映射（WeakMap），创建/复用/移除节点。
+ * - 消费 Presentation 下发的切场景计划（transitionPlan），按计划写入 delay/from/to。
+ * - 执行两帧入场机制（Phase 1 → reflow → Phase 2），避免动画被浏览器合并吞掉。
+ * - 调用 Layout.resolve 进行百分比到像素的换算，最终通过 transform 更新 DOM。
+ *
+ * 不做的事
+ * - 不决定场景导航方向（forward/backward）。
+ * - 不做 delay 取值来源选择、不做 backward 镜像。
+ * - 不修改 Element 本体的数据结构（不把 DOM 引用塞进 Element）。
+ *
+ * 关键不变量
+ * - onSceneChanged 必须是“确定性的单次执行”：一次切场景只做一次计划执行，不做隐式循环。
+ * - 两帧机制只用于“入场元素”（本次首次出现且有 fromState），避免对普通元素引入多帧抖动。
+ *
+ * 失败模式（常见症状）
+ * - 若 contentRect 未准备好（宽高=0），Layout.resolve 会把百分比坐标解算成 (0,0)，表现为“首次从左上飘入”。
+ * - 若同一帧内连续写入 fromState/toState，浏览器可能合并变更导致入场动画不触发。
+ * - 若元素节点首次创建时已带 transition 样式，紧接着写入 transform/layout，浏览器可能从默认值补间到目标值，
+ *   产生“首次从左上角运动/闪动”的错觉（尤其是 ImageElement 内部 base/highlight/window 子节点）。
+ *
+ * 预热（Prewarm）机制
+ * - 在展示当前场景时，Renderer 会预先创建并写入“前后若干场景（默认各 3）将出现的元素节点”。
+ * - 预热阶段强制：opacity=0、pointerEvents=none、禁用所有 transition（含 image 子节点）。
+ * - 当元素进入“本次切换的 transitionPlan”时，再启用 transition 并按 plan 执行动画。
+ *
+ * 性能注意
+ * - 强制 reflow（读取 offsetHeight/getBoundingClientRect）会阻塞布局流水线，只能在必要时使用。
+ * - ensureElementNode 会引起 DOM 增长，应只对本次需要渲染的元素调用。
  */
 export class Renderer {
     constructor() {
@@ -25,6 +50,15 @@ export class Renderer {
         this.nodes = new Set()
         this.presentation = null
         this.imageDecodeCache = new Map()
+
+        // 预热窗口：以当前场景为中心，向前/向后各预创建 N 张场景的元素节点。
+        this.PREWARM_BEHIND = 3
+        this.PREWARM_AHEAD = 3
+
+        // 首屏仅首次启动延迟播放（用于彻底规避首图首帧补间）。
+        this.hasPlayedInitialSceneAnimation = false
+        this.sceneChangeToken = 0
+        this.initialDelayTimer = null
     }
 
     /**
@@ -84,25 +118,50 @@ export class Renderer {
      * @param {Object|null} transitionContext - 包含目标场景动画配置等上下文
      */
     onSceneChanged(presentation, newScene, previousScene = null, transitionContext = null) {
-        // 计算导航方向
-        const fromIndex = previousScene ? presentation.scenes.indexOf(previousScene) : -1
-        const toIndex = presentation.scenes.indexOf(newScene)
-        const direction = fromIndex <= toIndex ? "forward" : "backward"
+        // Renderer 只做“执行”，不做“语义推导”。
+        // 语义推导（方向、delay 镜像、from/to 解析）应由 Presentation 生成 transitionPlan。
+        const transitionPlan = transitionContext && transitionContext.transitionPlan
 
+        // 约束：Renderer 不再提供 legacy 语义推导。
+        // 若缺少 plan，说明调用链绕过了 Presentation.setScene/onSceneChanged 的兜底逻辑。
+        if (!transitionPlan) {
+            throw new Error(
+                "Renderer.onSceneChanged 需要 transitionPlan：请通过 Presentation.setScene() 触发切场景，或在 Presentation.onSceneChanged(...) 的 transitionContext 中提供 transitionPlan"
+            )
+        }
+
+        // === 执行流程概览（plan 模式）===
+        // 参考机制文档：docs/两帧渲染机制.md
+        //
+        // Step 1：遍历 plan.items，对每个元素执行一次“本次切换需要的写入”（delay / from / to）。
+        //   - 意义：把语义层计算出的结果稳定写入 DOM，确保 transitionDelay/from/to 在同一次切换中一致。
+        // Step 2：对“入场元素”触发两帧机制：
+        //   Phase 1（同步）：禁用过渡 + 写 fromState（把起始态真正提交到渲染树）
+        //   reflow（同步）：强制浏览器记录 Phase 1 样式
+        //   Phase 2（rAF）：恢复过渡 + 写 toState（触发 CSS transition）
         const enteringItems = []
 
-        for (const element of presentation.elements) {
-            const transition = presentation.resolveElementTransition(
-                element,
-                previousScene,
-                newScene,
-                direction
-            )
-            const node = this.elementToDOM.get(element)
-            const hasRenderableState = Boolean(transition.fromState || transition.toState)
+        // 用于避免“延迟 Phase2”跨场景误触发。
+        this.sceneChangeToken += 1
+        const sceneToken = this.sceneChangeToken
+        if (this.initialDelayTimer) {
+            clearTimeout(this.initialDelayTimer)
+            this.initialDelayTimer = null
+        }
 
-            // 场景切换时跳过完全无关元素，降低全量 DOM 更新成本。
-            if (!hasRenderableState) {
+        // prewarm 不能影响本次切换涉及的元素（尤其是离场元素），否则会造成“整场瞬消”。
+        const protectedIds = new Set()
+        for (const item of transitionPlan.items) {
+            if (item && item.hasRenderableState) {
+                protectedIds.add(item.elementId)
+            }
+        }
+
+        for (const item of transitionPlan.items) {
+            const element = item.element
+            let node = this.elementToDOM.get(element)
+
+            if (!item.hasRenderableState) {
                 if (node) {
                     node.style.opacity = "0"
                     node.style.pointerEvents = "none"
@@ -110,21 +169,40 @@ export class Renderer {
                 continue
             }
 
-            const wasInPreviousScene = Boolean(
-                previousScene && presentation.getResolvedState(previousScene, element)
-            )
-            const isEntering = Boolean(transition.fromState && !wasInPreviousScene)
+            // 仅对“本次需要渲染”的元素确保节点存在，避免无谓 DOM 增长。
+            if (!node) {
+                node = this.ensureElementNode(presentation, element, presentation.content)
+            }
 
-            if (isEntering) {
+            // delay：由 plan 提供最终值；Renderer 不再计算方向与镜像。
+            node.style.setProperty(
+                `--silkyscene-transition-delay-${item.elementId}`,
+                `${item.finalDelay}ms`
+            )
+
+            if (item.isEntering) {
                 // === 入场元素：Phase 1（同步）先到 fromState，禁用过渡 ===
-                const enteringNode = this.ensureElementNode(presentation, element, presentation.content)
-                enteringNode.style.transitionDuration = "0ms"
-                this.applyElementState(presentation, element, transition.fromState)
-                enteringItems.push({ element, toState: transition.toState })
+                // 注意：此处必须“完全禁用 transition”后再写 fromState（含 image 子节点），
+                // 否则节点首次创建时可能从默认值 (0,0) 补间到目标值，产生首帧跳变。
+                this.applyElementState(presentation, element, item.fromState, {
+                    disableTransitions: true,
+                })
+                enteringItems.push({ element, toState: item.toState })
             } else {
                 // === 普通元素（含位移、出场）：直接应用 toState，CSS 过渡自动触发 ===
-                this.applyElementState(presentation, element, transition.toState)
+                // 仅当元素进入本次 plan 才启用 transition；预热阶段可能禁用了 transition。
+                this.enableTransitionsForElement(presentation, element)
+                this.applyElementState(presentation, element, item.toState)
             }
+        }
+
+        // 切到新场景后，立即预热邻近场景元素节点（前后各 N）。
+        // 注意：只预热“当前不可见”的元素，避免覆盖当前画面。
+        const toIndex = presentation && presentation.program
+            ? presentation.program.getSceneIndex(newScene)
+            : -1
+        if (toIndex >= 0) {
+            this.prewarmAroundScene(presentation, toIndex, protectedIds)
         }
 
         if (enteringItems.length === 0) {
@@ -134,16 +212,263 @@ export class Renderer {
         // 强制 reflow，确保浏览器已记录 fromState
         void presentation.content.offsetHeight
 
-        // === Phase 2（下一帧）：恢复过渡，动画到 toState ===
-        requestAnimationFrame(() => {
-            for (const { element, toState } of enteringItems) {
-                const node = this.elementToDOM.get(element)
-                if (node) {
-                    node.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+        const runPhase2 = () => {
+            // === Phase 2（下一帧）：恢复过渡，动画到 toState ===
+            requestAnimationFrame(() => {
+                if (sceneToken !== this.sceneChangeToken) {
+                    return
                 }
-                this.applyElementState(presentation, element, toState)
+
+                for (const { element, toState } of enteringItems) {
+                    // Phase 1 禁用了 transition，这里统一恢复后再写入 toState。
+                    this.enableTransitionsForElement(presentation, element)
+                    this.setElementTransitionDuration(
+                        presentation,
+                        element,
+                        "var(--silkyscene-transition-duration, 800ms)"
+                    )
+                    this.applyElementState(presentation, element, toState)
+                }
+            })
+        }
+
+        // 首次启动：等待一小段时间再播放首页入场动画（只触发一次）。
+        if (!previousScene && this.hasPlayedInitialSceneAnimation === false) {
+            this.hasPlayedInitialSceneAnimation = true
+            this.initialDelayTimer = setTimeout(runPhase2, 500)
+            return
+        }
+
+        runPhase2()
+    }
+
+    /**
+     * 预热指定场景索引附近（前后各 N 张）的元素节点。
+     *
+     * 行为：
+     * - 仅对“将出现但当前场景不可见”的元素创建节点并写入一次稳定样式；
+     * - 强制禁用 transition，并覆盖 opacity=0/pointerEvents=none。
+     *
+     * 目的：避免元素首次创建时从默认样式补间到目标样式，出现从左上角飘入/闪动。
+     *
+     * @param {Presentation} presentation
+     * @param {number} centerIndex
+     */
+    prewarmAroundScene(presentation, centerIndex, protectedIds = null) {
+        if (!presentation || !presentation.program) {
+            return
+        }
+
+        const snapshots = presentation.program.snapshots || []
+        if (!Array.isArray(snapshots) || snapshots.length === 0) {
+            return
+        }
+
+        const centerSnapshot = presentation.program.getSnapshotByIndex(centerIndex)
+        if (!centerSnapshot) {
+            return
+        }
+
+        const start = Math.max(0, centerIndex - this.PREWARM_BEHIND)
+        const end = Math.min(snapshots.length - 1, centerIndex + this.PREWARM_AHEAD)
+
+        const candidateIds = new Set()
+        for (let i = start; i <= end; i += 1) {
+            const snapshot = presentation.program.getSnapshotByIndex(i)
+            if (!snapshot) {
+                continue
             }
-        })
+            for (const elementId of snapshot.renderableStatesById.keys()) {
+                candidateIds.add(elementId)
+            }
+        }
+
+        const currentVisibleIds = new Set(centerSnapshot.renderableStatesById.keys())
+
+        const elementById = new Map(
+            (presentation.program.elements || []).map((element) => [element.id, element])
+        )
+
+        const protectedSet = protectedIds instanceof Set
+            ? protectedIds
+            : new Set(Array.isArray(protectedIds) ? protectedIds : [])
+
+        for (const elementId of candidateIds) {
+            if (protectedSet.has(elementId)) {
+                continue
+            }
+            if (currentVisibleIds.has(elementId)) {
+                continue
+            }
+
+            const element = elementById.get(elementId)
+            if (!element) {
+                continue
+            }
+
+            // 找到“距离当前最近”的那个出现该元素的快照，用于预热写入。
+            let bestIndex = null
+            let bestDistance = Infinity
+            for (let i = start; i <= end; i += 1) {
+                const snapshot = presentation.program.getSnapshotByIndex(i)
+                if (!snapshot) {
+                    continue
+                }
+                if (!snapshot.renderableStatesById.has(elementId)) {
+                    continue
+                }
+
+                const distance = Math.abs(i - centerIndex)
+                if (distance < bestDistance) {
+                    bestDistance = distance
+                    bestIndex = i
+                }
+            }
+
+            if (bestIndex == null) {
+                continue
+            }
+
+            const bestSnapshot = presentation.program.getSnapshotByIndex(bestIndex)
+            const prewarmState = bestSnapshot
+                ? (bestSnapshot.renderableStatesById.get(elementId) || null)
+                : null
+
+            // 预热阶段禁用所有 transition，避免首次写入样式触发补间。
+            // 注意：applyElementState 内会 ensureElementNode/ensureImageLayerNodes，
+            // 因此必须在 applyElementState 过程中就带上 disableTransitions。
+            this.applyElementState(presentation, element, prewarmState, {
+                disableTransitions: true,
+            })
+
+            const node = this.elementToDOM.get(element)
+            if (node) {
+                node.style.opacity = "0"
+                node.style.pointerEvents = "none"
+            }
+        }
+    }
+
+    /**
+     * 禁用某个元素节点（含子节点）的 transition。
+     * @param {HTMLElement} node
+     * @param {string} elementType
+     */
+    disableTransitionsForElement(node, elementType) {
+        if (!node) {
+            return
+        }
+
+        node.style.transitionProperty = "none"
+        node.style.transitionDuration = "0ms"
+        node.style.transitionTimingFunction = "linear"
+        node.style.transitionDelay = "0ms"
+
+        if (elementType === "image") {
+            const layers = this.ensureImageLayerNodes(node, { disableTransitions: true })
+            this.disableTransitionsForImageLayers(layers)
+        }
+    }
+
+    /**
+     * 启用某个元素节点（含子节点）的 transition。
+     * @param {Presentation} presentation
+     * @param {BaseElement} element
+     */
+    enableTransitionsForElement(presentation, element) {
+        if (!element) {
+            return
+        }
+
+        const node = this.elementToDOM.get(element)
+        if (!node) {
+            return
+        }
+
+        node.style.transitionProperty = "transform, opacity, background-color, color, width, height, border-radius, border-width"
+        node.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+        node.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+        node.style.transitionDelay = `var(--silkyscene-transition-delay-${element.id}, 0ms)`
+
+        if (element.type === "image") {
+            const layers = this.ensureImageLayerNodes(node)
+            this.enableTransitionsForImageLayers(layers)
+        }
+    }
+
+    /**
+     * 设置元素节点（含 image 子节点）的 transitionDuration。
+     * 用于两帧入场机制：Phase1 强制 0ms，Phase2 恢复 var。
+     * @param {Presentation} presentation
+     * @param {BaseElement} element
+     * @param {string} duration
+     */
+    setElementTransitionDuration(presentation, element, duration) {
+        if (!element) {
+            return
+        }
+
+        const node = this.elementToDOM.get(element)
+        if (node) {
+            node.style.transitionDuration = duration
+        }
+
+        if (element.type === "image" && node) {
+            const layers = this.ensureImageLayerNodes(node)
+            if (layers && layers.base) {
+                layers.base.style.transitionDuration = duration
+            }
+            if (layers && layers.window) {
+                layers.window.style.transitionDuration = duration
+            }
+            if (layers && layers.highlight) {
+                layers.highlight.style.transitionDuration = duration
+            }
+        }
+    }
+
+    disableTransitionsForImageLayers(layers) {
+        if (!layers) {
+            return
+        }
+
+        const nodes = [layers.base, layers.window, layers.highlight]
+        for (const n of nodes) {
+            if (!n) {
+                continue
+            }
+            n.style.transitionProperty = "none"
+            n.style.transitionDuration = "0ms"
+            n.style.transitionTimingFunction = "linear"
+            n.style.transitionDelay = "0ms"
+        }
+    }
+
+    enableTransitionsForImageLayers(layers) {
+        if (!layers) {
+            return
+        }
+
+        if (layers.base) {
+            layers.base.style.transitionProperty = "transform, filter"
+            layers.base.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+            layers.base.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            layers.base.style.transitionDelay = "0ms"
+        }
+
+        if (layers.window) {
+            layers.window.style.transitionProperty = "left, top, width, height, border-radius, opacity"
+            layers.window.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+            layers.window.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            layers.window.style.transitionDelay = "0ms"
+        }
+
+        if (layers.highlight) {
+            layers.highlight.style.transitionProperty = "left, top, width, height, transform"
+            layers.highlight.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+            layers.highlight.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            layers.highlight.style.transitionDelay = "0ms"
+        }
     }
 
     /**
@@ -171,6 +496,7 @@ export class Renderer {
         node.style.transitionProperty = "transform, opacity, background-color, color, width, height, border-radius, border-width"
         node.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
         node.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+        node.style.transitionDelay = `var(--silkyscene-transition-delay-${element.id}, 0ms)`
 
         parentNode.appendChild(node)
         this.elementToDOM.set(element, node)
@@ -189,6 +515,10 @@ export class Renderer {
         const containerWidth = renderContext.containerWidth ?? presentation.content.clientWidth
         const containerHeight = renderContext.containerHeight ?? presentation.content.clientHeight
         const node = this.ensureElementNode(presentation, element, parentNode)
+
+        if (renderContext && renderContext.disableTransitions === true) {
+            this.disableTransitionsForElement(node, element.type)
+        }
 
         if (!sceneState || sceneState.visible === false) {
             node.style.opacity = "0"
@@ -237,11 +567,12 @@ export class Renderer {
             })
         }
 
-        node.style.opacity = `${sceneState.opacity ?? element.opacity ?? 1}`
+        const opacityValue = sceneState.opacity ?? element.opacity ?? 1
+        node.style.opacity = `${opacityValue}`
         node.style.zIndex = `${sceneState.zIndex ?? element.zIndex ?? 0}`
-        node.style.pointerEvents = "auto"
 
-        this.renderElementChildren(presentation, element, node)
+        const opacityNumber = Number(opacityValue)
+        node.style.pointerEvents = Number.isFinite(opacityNumber) && opacityNumber <= 0 ? "none" : "auto"
         element.dirty = false
     }
 
@@ -308,6 +639,9 @@ export class Renderer {
      * 确保图片节点结构：暗图层 + 高亮窗图层。
      */
     ensureImageLayerNodes(node) {
+        const options = arguments.length > 1 ? arguments[1] : {}
+        const disableTransitions = Boolean(options && options.disableTransitions)
+
         let base = node.querySelector(".silkyscene-image-base")
         if (!base || base.tagName !== "IMG") {
             node.textContent = ""
@@ -322,9 +656,15 @@ export class Renderer {
             base.style.display = "block"
             base.style.transformOrigin = "50% 50%"
             base.style.willChange = "transform, filter"
-            base.style.transitionProperty = "transform, filter"
-            base.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
-            base.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            if (disableTransitions) {
+                base.style.transitionProperty = "none"
+                base.style.transitionDuration = "0ms"
+                base.style.transitionTimingFunction = "linear"
+            } else {
+                base.style.transitionProperty = "transform, filter"
+                base.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+                base.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            }
             node.appendChild(base)
         }
 
@@ -340,9 +680,15 @@ export class Renderer {
             windowNode.style.display = "none"
             windowNode.style.overflow = "hidden"
             windowNode.style.pointerEvents = "none"
-            windowNode.style.transitionProperty = "left, top, width, height, border-radius, opacity"
-            windowNode.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
-            windowNode.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            if (disableTransitions) {
+                windowNode.style.transitionProperty = "none"
+                windowNode.style.transitionDuration = "0ms"
+                windowNode.style.transitionTimingFunction = "linear"
+            } else {
+                windowNode.style.transitionProperty = "left, top, width, height, border-radius, opacity"
+                windowNode.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+                windowNode.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            }
             node.appendChild(windowNode)
         }
 
@@ -360,9 +706,15 @@ export class Renderer {
             highlight.style.display = "block"
             highlight.style.transformOrigin = "50% 50%"
             highlight.style.willChange = "left, top, width, height, transform"
-            highlight.style.transitionProperty = "left, top, width, height, transform"
-            highlight.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
-            highlight.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            if (disableTransitions) {
+                highlight.style.transitionProperty = "none"
+                highlight.style.transitionDuration = "0ms"
+                highlight.style.transitionTimingFunction = "linear"
+            } else {
+                highlight.style.transitionProperty = "left, top, width, height, transform"
+                highlight.style.transitionDuration = "var(--silkyscene-transition-duration, 800ms)"
+                highlight.style.transitionTimingFunction = "var(--silkyscene-transition-easing, ease)"
+            }
             windowNode.appendChild(highlight)
         }
 
@@ -702,8 +1054,6 @@ export class Renderer {
      * 渲染箭头节点（父节点 + 3 条子线）。
      */
     renderArrowNode(node, element, sceneState, context) {
-        node.textContent = ""
-
         const geometry = this.resolveLineGeometry(element, sceneState, context)
         const transformState = sceneState.transform || {}
         const sizeBase = this.getSizeBase(context.containerWidth, context.containerHeight)
@@ -733,11 +1083,18 @@ export class Renderer {
         const r = geometry.angle + Number(transformState.rotation || 0)
         node.style.transform = `translate3d(${tx}px, ${ty}px, 0) rotate(${r}rad) scale(${sx}, ${sy})`
 
-        if (element.children.length < 3) {
+        // ArrowElement 为复合渲染：内部包含 3 条线段（shaft/headA/headB）。
+        // 该“复合结构”是渲染实现细节，不再依赖 BaseElement.children。
+        const shaft = element && element.shaft
+        const headA = element && element.headA
+        const headB = element && element.headB
+        if (!shaft || !headA || !headB) {
+            node.textContent = ""
             return
         }
 
-        const [shaft, headA, headB] = element.children
+        node.style.position = "relative"
+        const parts = this.ensureArrowSegmentNodes(node)
         const childSizeBase = this.getSizeBase(
             geometry.length,
             Math.max(geometry.strokeWidth, arrowWidth)
@@ -764,11 +1121,67 @@ export class Renderer {
         headB.strokeWidth = strokeWidthPercent
         headB.color = geometry.color
 
+        const childContext = {
+            containerWidth: geometry.length,
+            containerHeight: Math.max(geometry.strokeWidth, arrowWidth),
+        }
+        // 复用 line 渲染逻辑：将 3 段线当作“在 arrow 节点内部坐标系中的 line 元素”渲染。
+        this.renderLineNode(parts.shaft, shaft, {}, childContext)
+        this.renderLineNode(parts.headA, headA, {}, childContext)
+        this.renderLineNode(parts.headB, headB, {}, childContext)
+
         element.computed = {
             x: geometry.x1,
             y: geometry.y1,
             width: geometry.length,
             height: Math.max(geometry.strokeWidth, arrowWidth),
+        }
+    }
+
+    /**
+     * 确保箭头内部的 3 个线段节点存在，并返回它们。
+     * @param {HTMLElement} node
+     * @returns {{shaft: HTMLElement, headA: HTMLElement, headB: HTMLElement}}
+     */
+    ensureArrowSegmentNodes(node) {
+        const children = Array.from(node.children || [])
+        const hasThree = children.length === 3
+        const matches =
+            hasThree &&
+            children[0].getAttribute("data-silkyscene-arrow-part") === "shaft" &&
+            children[1].getAttribute("data-silkyscene-arrow-part") === "headA" &&
+            children[2].getAttribute("data-silkyscene-arrow-part") === "headB"
+
+        if (!matches) {
+            node.textContent = ""
+
+            const shaft = document.createElement("div")
+            shaft.setAttribute("data-silkyscene-arrow-part", "shaft")
+
+            const headA = document.createElement("div")
+            headA.setAttribute("data-silkyscene-arrow-part", "headA")
+
+            const headB = document.createElement("div")
+            headB.setAttribute("data-silkyscene-arrow-part", "headB")
+
+            node.appendChild(shaft)
+            node.appendChild(headA)
+            node.appendChild(headB)
+        }
+
+        const [shaftNode, headANode, headBNode] = Array.from(node.children || [])
+        for (const child of [shaftNode, headANode, headBNode]) {
+            if (child && child.style) {
+                child.style.position = "absolute"
+                child.style.left = "0"
+                child.style.top = "0"
+            }
+        }
+
+        return {
+            shaft: shaftNode,
+            headA: headANode,
+            headB: headBNode,
         }
     }
 
@@ -824,12 +1237,29 @@ export class Renderer {
         node.style.borderWidth = stroke === "none" ? "0px" : `${strokeWidth}px`
         node.style.borderRadius = cornerRadius
 
-        const rect = node.getBoundingClientRect()
         const anchorX = Number(layout.anchorX || 0)
         const anchorY = Number(layout.anchorY || 0)
+        const clamp01 = (v) => {
+            if (!Number.isFinite(v)) return 0
+            return v < 0 ? 0 : (v > 1 ? 1 : v)
+        }
+        const ax = clamp01(anchorX)
+        const ay = clamp01(anchorY)
+        node.style.transformOrigin = `${ax * 100}% ${ay * 100}%`
+
+        // 关键修复：不要用 getBoundingClientRect() 的宽高参与 anchor 位移计算。
+        // boundingClientRect 会受上一帧/上一场景残留 transform（scale/rotate）影响，导致切回时漂移。
+        // 优先使用 computed 宽高；若为 0（例如 auto 文本），回退到 offsetWidth/offsetHeight（不受 transform 影响）。
+        const anchorWidth = (computed && computed.width > 0)
+            ? computed.width
+            : (node.offsetWidth || 0)
+        const anchorHeight = (computed && computed.height > 0)
+            ? computed.height
+            : (node.offsetHeight || 0)
+
         const transformState = sceneState.transform || {}
-        const translateX = computed.x - rect.width * anchorX + this.resolveTransformOffset(transformState.x, sizeBase, "transform.x")
-        const translateY = computed.y - rect.height * anchorY + this.resolveTransformOffset(transformState.y, sizeBase, "transform.y")
+        const translateX = computed.x - anchorWidth * ax + this.resolveTransformOffset(transformState.x, sizeBase, "transform.x")
+        const translateY = computed.y - anchorHeight * ay + this.resolveTransformOffset(transformState.y, sizeBase, "transform.y")
         const scaleX = Number(transformState.scaleX || 1)
         const scaleY = Number(transformState.scaleY || 1)
         const rotation = Number(transformState.rotation || 0)
@@ -837,51 +1267,6 @@ export class Renderer {
         node.style.transform = `translate3d(${translateX}px, ${translateY}px, 0) rotate(${rotation}rad) scale(${scaleX}, ${scaleY})`
     }
 
-    /**
-     * 递归渲染子元素。
-     */
-    renderElementChildren(presentation, element, parentNode) {
-        if (!element.children || !element.children.length) {
-            return
-        }
-
-        const containerWidth = Number(element.computed && element.computed.width) || presentation.content.clientWidth
-        const containerHeight = Number(element.computed && element.computed.height) || presentation.content.clientHeight
-
-        for (const child of element.children) {
-            const childState = this.buildChildIntrinsicState(child)
-            this.applyElementState(presentation, child, childState, {
-                parentNode,
-                containerWidth,
-                containerHeight,
-            })
-        }
-    }
-
-    /**
-     * 为子元素构建内置状态（用于组合元素内部渲染）。
-     */
-    buildChildIntrinsicState(element) {
-        return {
-            layout: element.layout || {
-                mode: "absolute",
-                left: 0,
-                top: 0,
-                anchorX: 0,
-                anchorY: 0,
-            },
-            transform: element.transform || {
-                x: 0,
-                y: 0,
-                scaleX: 1,
-                scaleY: 1,
-                rotation: 0,
-            },
-            opacity: element.opacity ?? 1,
-            zIndex: element.zIndex ?? 0,
-            visible: element.visible !== false,
-        }
-    }
 
     /**
      * 应用通用布局 + 变换逻辑。
@@ -902,14 +1287,28 @@ export class Renderer {
             node.style.height = `${computed.height}px`
         }
 
-        const rect = node.getBoundingClientRect()
         const anchorX = Number(layout.anchorX || 0)
         const anchorY = Number(layout.anchorY || 0)
+        const clamp01 = (v) => {
+            if (!Number.isFinite(v)) return 0
+            return v < 0 ? 0 : (v > 1 ? 1 : v)
+        }
+        const ax = clamp01(anchorX)
+        const ay = clamp01(anchorY)
+        node.style.transformOrigin = `${ax * 100}% ${ay * 100}%`
+
+        // 关键修复：使用不受 transform 影响的尺寸来做 anchor 位移。
+        const anchorWidth = (computed && computed.width > 0)
+            ? computed.width
+            : (node.offsetWidth || 0)
+        const anchorHeight = (computed && computed.height > 0)
+            ? computed.height
+            : (node.offsetHeight || 0)
 
         const transformState = sceneState.transform || {}
         const sizeBase = this.getSizeBase(context.containerWidth, context.containerHeight)
-        const translateX = computed.x - rect.width * anchorX + this.resolveTransformOffset(transformState.x, sizeBase, "transform.x")
-        const translateY = computed.y - rect.height * anchorY + this.resolveTransformOffset(transformState.y, sizeBase, "transform.y")
+        const translateX = computed.x - anchorWidth * ax + this.resolveTransformOffset(transformState.x, sizeBase, "transform.x")
+        const translateY = computed.y - anchorHeight * ay + this.resolveTransformOffset(transformState.y, sizeBase, "transform.y")
         const scaleX = Number(transformState.scaleX || 1)
         const scaleY = Number(transformState.scaleY || 1)
         const rotation = Number(transformState.rotation || 0)

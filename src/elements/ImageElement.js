@@ -3,7 +3,8 @@
  *
  * 用于图片、插图、背景、图标等内容的渲染与缩放裁切。
  */
-import { BaseElement } from "../BaseElement.js"
+import { BaseElement } from "../core/BaseElement.js"
+import { image } from "../render/primitives.js"
 
 export class ImageElement extends BaseElement {
     /**
@@ -24,7 +25,7 @@ export class ImageElement extends BaseElement {
     constructor(options = {}) {
         super(options)
         this.type = "image"
-        
+
         // 图片特定属性
         this.src = options.src || ""
         this.alt = options.alt || ""
@@ -33,5 +34,37 @@ export class ImageElement extends BaseElement {
         this.cropY = options.cropY || 0
         this.cropWidth = options.cropWidth || null
         this.cropHeight = options.cropHeight || null
+    }
+
+    lowerToPrimitives(renderableState, meta, context = {}) {
+        const state = renderableState || {}
+        const imageState = (state && state.image) || {}
+
+        const visible = state.visible !== false && this.visible !== false
+        const opacityValue = state.opacity ?? this.opacity ?? 1
+        const opacityNumber = Number(opacityValue)
+        const opacity = visible ? opacityValue : 0
+        const pointerEvents =
+            visible && Number.isFinite(opacityNumber) && opacityNumber > 0 ? "auto" : "none"
+
+        const fit = imageState.fit ?? this.objectFit ?? this.fit ?? "cover"
+
+        return image(this.id, {
+            layout: state.layout ?? this.layout ?? null,
+            transform: state.transform ?? this.transform ?? null,
+            style: {
+                opacity,
+                zIndex: state.zIndex ?? this.zIndex ?? 0,
+                pointerEvents,
+            },
+            props: {
+                src: String(this.src || ""),
+                alt: String(this.alt || ""),
+                fit: String(fit),
+                crop: imageState.crop ?? null,
+                highlight: imageState.highlight ?? null,
+                filter: imageState.filter ?? null,
+            },
+        })
     }
 }

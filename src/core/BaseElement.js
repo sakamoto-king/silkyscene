@@ -31,16 +31,16 @@ export class BaseElement {
         this.visible = options.visible !== undefined ? options.visible : true
         this.locked = options.locked || false
 
-        // 第二层：层级结构
-        this.parent = null
-        this.children = []
+        // 第二层：层级结构（已移除）
+        // 约定：元素之间的“父子关系/参考系绑定”属于 Scene 的状态语义（stateMeta.parent），
+        // 不应存储在 BaseElement 实例内部，避免数据源重复与状态不一致。
 
         // 第三层：布局数据（用户定义）
         // mode: "relative" | "absolute" | "flex" 等
         // left/top/width/height：可以是像素、百分比或 "auto"
         // anchorX/anchorY：0-1 范围，旋转与缩放的锚点
         this.layout = options.layout || {
-            mode: "relative",
+            mode: "absolute",
             left: 0,
             top: 0,
             width: "auto",
@@ -80,41 +80,21 @@ export class BaseElement {
     }
 
     /**
-     * 将子元素添加到当前元素
-     * @param {BaseElement} child
+     * Lowering：把“业务 Element”下沉为“基础图元树（PrimitiveRenderSpec RenderTree）”。
+     *
+     * 约束：
+     * - 返回值只能包含 Primitive kind（Group/Text/Image/Shape/Path/Video）。
+     * - 允许输出 Definition（包含 % 等相对值）；这些相对值必须在后续 Resolve 阶段解算。
+     * - Renderer 不应理解具体 element.type，只应调用此接口并消费基础图元。
+     *
+     * @param {Object|null} renderableState - 编译后的渲染态（含 compiled layout 覆盖）
+     * @param {Object|null} meta - 编译后的 meta（delay/entrance/parent/flow 等）
+     * @param {Object} context
+     * @returns {Object|null} PrimitiveRenderSpec node
      */
-    addChild(child) {
-        if (!child || !(child instanceof BaseElement)) {
-            throw new Error("只能添加 BaseElement 实例作为子元素")
-        }
-        if (child.parent) {
-            child.parent.removeChild(child)
-        }
-        child.parent = this
-        this.children.push(child)
-        this.markDirty()
-    }
-
-    /**
-     * 从当前元素移除子元素
-     * @param {BaseElement} child
-     */
-    removeChild(child) {
-        const index = this.children.indexOf(child)
-        if (index !== -1) {
-            this.children.splice(index, 1)
-            child.parent = null
-            this.markDirty()
-        }
-    }
-
-    /**
-     * 标记元素及其父级为脏状态，触发重新计算
-     */
-    markDirty() {
-        this.dirty = true
-        if (this.parent) {
-            this.parent.markDirty()
-        }
+    lowerToPrimitives(renderableState, meta, context = {}) {
+        throw new Error(
+            `Element(${this.type || "element"}) 未实现 lowerToPrimitives；Renderer 不应再理解 element.type 分支`
+        )
     }
 }

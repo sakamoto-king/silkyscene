@@ -1,11 +1,39 @@
-import { deepMerge } from "./utils/deepMerge.js"
-import { Renderer } from "./Renderer.js"
+import { deepMerge } from "../utils/deepMerge.js"
+import { Renderer } from "../legacy/Renderer.js"
+import { TextElement } from "../elements/TextElement.js"
+import { createElementByType } from "../elements/createElementByType.js"
+import { CompiledProgram } from "../compiler/CompiledProgram.js"
+import { SceneGeometry } from "../geometry/SceneGeometry.js"
 
 /**
- * 演示文稿实例。
- * 
- * Presentation 管理元素生命周期、场景编排与演示状态。
- * 不负责布局计算或容器尺寸监听，由应用层控制容器样式。
+ * Presentation（演示编排器 / 语义计划生成器）。
+ *
+ * Presentation 的核心定位：
+ * - 管理 Element/Scene 生命周期与场景编排（start/stop、add/remove、setScene）。
+ * - 维护运行时预编译产物（program）：场景快照（最终态 + meta + 编译布局）与相邻切换计划缓存。
+ * - 切场景时只读取预编译 plan 并下发给 Renderer，避免在用户点击“切换”那一刻实时演算。
+ *
+ * 职责
+ * - 容器与内容层（container/content）的初始化与样式写入（含场景切换动画参数的 CSS 变量）。
+ * - 预编译触发：ensureProgramCompiled（快照 + 相邻计划缓存）。
+ * - 切场景调度：根据 from/to 索引读取相邻 plan；非相邻跳转按需基于快照生成 plan。
+ * - 交互绑定：键盘/触摸翻页（可配置）。
+ *
+ * 不做的事
+ * - 不直接操作每个 Element 的 DOM 节点（由 Renderer 负责）。
+ * - 不在这里做 Layout.resolve 的像素级换算（由 Renderer/布局系统负责）。
+ *
+ * 关键不变量
+ * - resolved cache 的继承规则必须稳定：未声明→继承；removeState→阻断继承；setState→覆盖。
+ * - transitionPlan 必须是纯数据描述（不含 DOM 引用），以便测试与复用。
+ *
+ * 失败模式（常见症状）
+ * - 若 contentRect 未同步且宽高为 0，Renderer/Layout 的百分比换算会退化为 (0,0)。
+ *   该问题在首次启动/首次显示时更易出现，因此 start/setScene 需要兜底 flush。
+ *
+ * 性能注意
+ * - ensureContentRectReady 内部可能触发 layout flush（getBoundingClientRect）。应避免在高频循环中调用。
+ * - rebuildResolvedSceneCache 会遍历 scenes × elements，属于相对重操作，应由 dirty 标记控制触发频率。
  */
 export class Presentation {
 
@@ -88,12 +116,8 @@ export class Presentation {
         // 默认渲染器
         this.renderer = null
 
-        // 场景最终态缓存（resolved state/meta）
-        this.resolvedSceneCache = new Map()
-        this.resolvedCacheDirty = true
-        this.cachedSceneCount = 0
-        this.cachedElementCount = 0
-        this.sceneStateVersionSnapshot = new WeakMap()
+        // 运行时预编译产物（场景快照 + 相邻切换计划缓存）
+        this.program = new CompiledProgram(this)
 
         // 图片预加载状态
         this.preloadTask = null
@@ -254,12 +278,19 @@ export class Presentation {
     start() {
         this.initContainerStyle()
 
-        // 在演示开始前统一预计算场景最终态，切换时直接读取缓存。
-        this.ensureResolvedSceneCache()
-
         if (!this.content.parentNode) {
             this.container.appendChild(this.content)
         }
+
+        // === Step 1：准备 contentRect（含 layout flush 兜底）===
+        // 做什么：同步内容层尺寸（contain 模式），并在启动时强制一次 layout flush。
+        // 依赖：容器已挂载到 DOM（content 已 append 到 container）。
+        // 意义：避免首帧 content 的 clientWidth/Height 仍为 0，导致百分比坐标被换算成 (0,0)。
+        // 注意：getBoundingClientRect 会触发 layout flush，不应在高频路径滥用；这里仅在 start 做一次强制兜底。
+        this.ensureContentRectReady({ forceFlush: true })
+
+        // 在演示开始前统一预编译场景快照与相邻切换计划，切换时直接读取缓存。
+        this.ensureProgramCompiled()
 
         this.ensureRenderer()
 
@@ -269,8 +300,6 @@ export class Presentation {
 
         // 初始化内容层动画配置，后续切场景时会按目标场景覆盖。
         this.applySceneTransitionStyle(this.currentSceneTransition)
-
-        this.updateContentRect()
         this.bindResizeObserver()
 
         if (this.navigation.keys.enabled) {
@@ -279,6 +308,34 @@ export class Presentation {
 
         if (this.navigation.touch.enabled) {
             this._bindTouchNavigation()
+        }
+    }
+
+    /**
+     * 确保 contentRect 已同步且可用于百分比到像素的换算。
+     *
+     * 何时使用：
+     * - start：首次启动时强制 flush 一次，保证后续切场景稳定。
+     * - setScene：切换前兜底同步，若尺寸仍为 0 再 flush + 重算。
+     *
+     * 为什么要这样做：
+     * - Layout/Renderer 在切场景时会读取 content 的宽高（clientWidth/Height）用于百分比换算。
+     * - 若容器首次显示、刚被插入 DOM 或刚发生尺寸变化，某些浏览器/时序下可能短暂返回 0。
+     * - 这会让百分比坐标被解算成 (0,0)，表现为“首次播放从左上飘入”。
+     *
+     * @param {Object} options
+     * @param {boolean} [options.forceFlush=false] - 是否强制进行一次 layout flush
+     */
+    ensureContentRectReady(options = {}) {
+        const forceFlush = Boolean(options && options.forceFlush)
+
+        this.updateContentRect()
+
+        const sizeInvalid = this.content.clientWidth <= 0 || this.content.clientHeight <= 0
+        if (forceFlush || sizeInvalid) {
+            // layout flush：确保浏览器提交了上面的样式写入。
+            void this.content.getBoundingClientRect()
+            this.updateContentRect()
         }
     }
 
@@ -409,7 +466,145 @@ export class Presentation {
         }
 
         this.elements.push(element)
-        this.markResolvedCacheDirty()
+        this.markProgramDirty()
+    }
+
+    /**
+     * 批量添加元素到演示。
+     * @param {Array} elements
+     * @returns {Presentation}
+     */
+    addElements(elements) {
+        if (!Array.isArray(elements)) {
+            throw new Error("addElements(elements) 需要传入数组")
+        }
+
+        for (const element of elements) {
+            this.addElement(element)
+        }
+
+        return this
+    }
+
+    /**
+     * 批量创建并注册元素。
+     *
+     * @param {Array<{type: string, name?: string, options?: Object}>} specs
+     * @param {Object} [options]
+     * @param {boolean} [options.strictNameUnique=true] - name 重复时是否抛错
+     * @param {string} [options.nameKey='name'] - specs 中 name 字段键名
+     * @returns {{ elements: Array, byName: Map<string, any>, byId: Map<string, any> }}
+     */
+    createElements(specs, options = {}) {
+        if (!Array.isArray(specs)) {
+            throw new Error("createElements(specs) 需要传入数组")
+        }
+
+        const strictNameUnique = options.strictNameUnique !== false
+        const nameKey = typeof options.nameKey === "string" && options.nameKey ? options.nameKey : "name"
+
+        const elements = []
+        const byName = new Map()
+        const byId = new Map()
+
+        for (const spec of specs) {
+            if (!spec || typeof spec !== "object") {
+                throw new Error("createElements(specs) specs 中存在无效项")
+            }
+
+            const type = spec.type
+            const rawOptions = spec.options && typeof spec.options === "object" ? spec.options : {}
+            const elementOptions = deepMerge({}, rawOptions)
+
+            const declaredName = spec[nameKey] ?? spec.name
+            if (declaredName != null) {
+                elementOptions.name = declaredName
+            }
+
+            const element = createElementByType(type, elementOptions)
+            if (!element) {
+                throw new Error(`createElements: 不支持的元素类型: ${type}`)
+            }
+
+            this.addElement(element)
+            elements.push(element)
+            byId.set(element.id, element)
+
+            const name = element && typeof element.name === "string" ? element.name : ""
+            if (name) {
+                if (strictNameUnique && byName.has(name)) {
+                    throw new Error(`createElements: 元素 name 重复: ${name}`)
+                }
+                if (!byName.has(name)) {
+                    byName.set(name, element)
+                }
+            }
+        }
+
+        return { elements, byName, byId }
+    }
+
+    /**
+     * 通过元素 name 查找。
+     * 默认扫描 elements（不维护全局索引，避免 remove/rename 导致索引过期）。
+     * @param {string} name
+     * @param {Object} [options]
+     * @param {boolean} [options.multiple=false] - 是否返回所有匹配项
+     * @param {boolean} [options.throwOnDuplicate=false] - multiple=false 且出现多个匹配时是否抛错
+     * @returns {any|Array<any>|null}
+     */
+    getElementByName(name, options = {}) {
+        const multiple = options && options.multiple === true
+        const throwOnDuplicate = options && options.throwOnDuplicate === true
+
+        const matches = []
+        for (const element of this.elements) {
+            if (element && element.name === name) {
+                if (multiple) {
+                    matches.push(element)
+                } else {
+                    if (!matches.length) {
+                        matches.push(element)
+                    } else if (throwOnDuplicate) {
+                        throw new Error(`getElementByName: name 重复: ${name}`)
+                    }
+                }
+            }
+        }
+
+        if (multiple) {
+            return matches
+        }
+
+        return matches.length ? matches[0] : null
+    }
+
+    /**
+     * 创建“同款文本”工厂函数。
+     * @param {Object} [baseOptions]
+     * @param {Object} [options]
+     * @param {boolean} [options.autoAdd=true] - 是否自动 addElement
+     * @param {string} [options.namePrefix] - 自动命名前缀（当未显式提供 name 时）
+     * @returns {(overrideOptions?: Object) => TextElement}
+     */
+    createTextFactory(baseOptions = {}, options = {}) {
+        const autoAdd = !(options && options.autoAdd === false)
+        const namePrefix = options && typeof options.namePrefix === "string" ? options.namePrefix : ""
+        let counter = 0
+
+        return (overrideOptions = {}) => {
+            const merged = deepMerge(deepMerge({}, baseOptions || {}), overrideOptions || {})
+            if (namePrefix && !merged.name) {
+                counter += 1
+                merged.name = `${namePrefix}${counter}`
+            }
+
+            const element = new TextElement(merged)
+            if (autoAdd) {
+                this.addElement(element)
+            }
+            return element
+        }
     }
 
     /**
@@ -420,7 +615,7 @@ export class Presentation {
         const index = this.elements.indexOf(element)
         if (index !== -1) {
             this.elements.splice(index, 1)
-            this.markResolvedCacheDirty()
+            this.markProgramDirty()
             if (this.renderer) {
                 this.renderer.removeElement(element)
             }
@@ -436,7 +631,7 @@ export class Presentation {
             throw new Error("场景必须是有效的 Scene 实例")
         }
         this.scenes.push(scene)
-        this.markResolvedCacheDirty()
+        this.markProgramDirty()
     }
 
     /**
@@ -447,17 +642,40 @@ export class Presentation {
         if (this.scenes.indexOf(scene) === -1) {
             throw new Error("指定的场景不属于此演示")
         }
-        this.ensureResolvedSceneCache()
+
+        // === Step 1：切场景前兜底 contentRect ===
+        // 做什么：同步 contentRect，必要时 flush。
+        // 意义：避免切场景时 Layout.resolve 用 0 尺寸计算百分比坐标。
+        this.ensureContentRectReady({ forceFlush: false })
+
+        this.ensureProgramCompiled()
         const previousScene = this.currentScene
         const transitionConfig = this.resolveSceneTransitionConfig(scene)
         this.currentSceneTransition = transitionConfig
+
+        // === Step 2：写入本次切场景的 transition 配置 ===
+        // 做什么：把 duration/easing 写到 content.style 与 CSS 变量。
+        // 意义：Renderer 子节点复用这份配置，确保整个场景切换的动画参数一致。
         this.applySceneTransitionStyle(transitionConfig)
         this.currentScene = scene
         this.ensureRenderer()
-        // 触发布局计算：Renderer 应该在此时读取新场景状态并计算布局
-        // 具体的动画插值与渲染在 Renderer 层实现
+
+        // === Step 3：生成“切场景执行计划”（语义层）===
+        // 做什么：根据 from/to 场景 + 方向，解析每个元素的 fromState/toState，并计算最终 delay。
+        // 意义：把方向、delay 镜像等语义从 Renderer 移出，Renderer 只消费 plan 执行渲染。
+        const toIndex = this.program.getSceneIndex(scene)
+        const fromIndex = previousScene ? this.program.getSceneIndex(previousScene) : null
+        const direction = fromIndex == null ? "forward" : (fromIndex <= toIndex ? "forward" : "backward")
+        const transitionPlan =
+            fromIndex != null
+                ? (this.program.getAdjacentPlan(fromIndex, toIndex) || this.program.buildPlan(fromIndex, toIndex, direction))
+                : this.program.buildPlan(null, toIndex, direction)
+
+        // === Step 4：交给 Renderer 执行（执行层）===
+        // Renderer 负责：节点创建/复用、写样式、两帧入场（Phase1/Phase2）、触发 reflow/rAF。
         this.onSceneChanged(scene, previousScene, {
             transition: transitionConfig,
+            transitionPlan,
         })
     }
 
@@ -488,8 +706,8 @@ export class Presentation {
             return false
         }
 
-        const currentIndex = this.getCurrentSceneIndex()
-        const isAtTail = currentIndex >= this.scenes.length - 1
+        const currentIndex = this.getCurrentSceneIndex() // 当前场景索引
+        const isAtTail = currentIndex >= this.scenes.length - 1 // 是否已到最后一个场景
 
         if (isAtTail) {
             if (!this.navigation.loop) {
@@ -510,8 +728,8 @@ export class Presentation {
             return false
         }
 
-        const currentIndex = this.getCurrentSceneIndex()
-        const isAtHead = currentIndex <= 0
+        const currentIndex = this.getCurrentSceneIndex() // 当前场景索引
+        const isAtHead = currentIndex <= 0 // 是否已到第一个场景
 
         if (isAtHead) {
             if (!this.navigation.loop) {
@@ -552,9 +770,28 @@ export class Presentation {
      * @param {Object|null} transitionContext
      */
     onSceneChanged(scene, previousScene = null, transitionContext = null) {
-        if (this.renderer) {
-            this.renderer.onSceneChanged(this, scene, previousScene, transitionContext)
+        if (!this.renderer) {
+            return
         }
+
+        // 兜底：Renderer 只执行 plan，不再做语义推导。
+        // 这允许应用层仅触发 onSceneChanged，而不必手动构造 transitionPlan。
+        const context = (transitionContext && typeof transitionContext === "object")
+            ? transitionContext
+            : {}
+
+        if (!context.transitionPlan) {
+            this.ensureProgramCompiled()
+            const toIndex = this.program.getSceneIndex(scene)
+            const fromIndex = previousScene ? this.program.getSceneIndex(previousScene) : null
+            const direction = fromIndex == null ? "forward" : (fromIndex <= toIndex ? "forward" : "backward")
+            context.transitionPlan =
+                fromIndex != null
+                    ? (this.program.getAdjacentPlan(fromIndex, toIndex) || this.program.buildPlan(fromIndex, toIndex, direction))
+                    : this.program.buildPlan(null, toIndex, direction)
+        }
+
+        this.renderer.onSceneChanged(this, scene, previousScene, context)
     }
 
     /**
@@ -934,254 +1171,23 @@ export class Presentation {
     }
 
     /**
-     * 解析某个元素在场景切换中的 from/to 状态。
-     *
-     * 根据导航方向和 entrance/exit 配置，计算元素的起始态与目标态，
-     * 供 Renderer 驱动动画。fromState/toState 均以场景原始状态为基础，
-     * 在其上叠加动画增量，保证布局信息始终包含在内。
-     *
-     * @param {BaseElement} element
-     * @param {Scene|null} fromScene
-     * @param {Scene} toScene
-     * @param {"forward"|"backward"} direction - 导航方向
-     * @returns {{fromState: Object|null, toState: Object|null, meta: Object}}
+     * 标记 program 预编译产物失效。
      */
-    resolveElementTransition(element, fromScene, toScene, direction = "forward") {
-        const rawFromState = fromScene ? this.getResolvedState(fromScene, element) : null
-        const rawToState = toScene ? this.getResolvedState(toScene, element) : null
-        const fromMeta = fromScene ? this.getResolvedMeta(fromScene, element) : null
-        const toMeta = toScene ? this.getResolvedMeta(toScene, element) : null
-
-        let fromState = rawFromState ? deepMerge({}, rawFromState) : null
-        let toState = rawToState ? deepMerge({}, rawToState) : null
-
-        if (direction === "forward") {
-            // 正向入场：元素在 toScene 首次出现，且配置了 entrance
-            if (!rawFromState && rawToState && this.hasEnabledEntrance(toMeta)) {
-                const overrides = this._buildAnimationOverrides(toMeta.entrance, "from")
-                fromState = deepMerge(deepMerge({}, rawToState), overrides)
-            }
-            // 正向出场：元素在 toScene 中不存在，且 fromScene 配置了 exit
-            if (rawFromState && !rawToState && this.hasEnabledExit(fromMeta)) {
-                const overrides = this._buildAnimationOverrides(fromMeta.exit, "to")
-                toState = deepMerge(deepMerge({}, rawFromState), overrides)
-            }
-        } else {
-            // 反向入场：从 exit 倒放入场（元素出现但 fromScene 无此元素）
-            if (!rawFromState && rawToState && this.hasEnabledExit(toMeta)) {
-                const overrides = this._buildAnimationOverrides(toMeta.exit, "to")
-                fromState = deepMerge(deepMerge({}, rawToState), overrides)
-            }
-            // 反向出场：从 entrance 倒放出场（元素消失但 toScene 无此元素）
-            if (rawFromState && !rawToState && this.hasEnabledEntrance(fromMeta)) {
-                const overrides = this._buildAnimationOverrides(fromMeta.entrance, "from")
-                toState = deepMerge(deepMerge({}, rawFromState), overrides)
-            }
-        }
-
-        return {
-            fromState,
-            toState,
-            meta: {
-                fromMeta,
-                toMeta,
-            },
+    markProgramDirty() {
+        if (this.program) {
+            this.program.markDirty()
         }
     }
 
     /**
-     * 从 entrance/exit 元数据构建动画覆盖状态（opacity + transform 增量）。
-     * 结果用于叠加到场景原始状态上，不含布局信息。
-     * @param {Object} animMeta - entrance 或 exit 对象 { from/to, distance }
-     * @param {"from"|"to"} key
-     * @returns {Object}
+     * 确保场景预编译产物可用。
      */
-    _buildAnimationOverrides(animMeta, key) {
-        const rawValue = animMeta ? animMeta[key] : null
-        let overrides = {}
-
-        if (rawValue == null) {
-            overrides = {}
-        } else if (typeof rawValue === "string") {
-            overrides = this.buildDirectionState(rawValue, animMeta.distance)
-        } else if (typeof rawValue === "object") {
-            overrides = deepMerge({}, rawValue)
+    ensureProgramCompiled() {
+        if (!this.program) {
+            this.program = new CompiledProgram(this)
         }
 
-        return deepMerge(overrides, this.pickVisibleTransitionDefaults(overrides))
-    }
-
-    /**
-     * 将方向关键字转换为动画状态增量。
-     * x/y 值为叠加在布局位置上的偏移，第一版使用百分比字符串（相对短边）。
-     * @param {"bottom"|"top"|"left"|"right"} keyword
-     * @param {string|null} [distance] - 偏移距离（百分比），默认 "4%"
-     * @returns {Object}
-     */
-    buildDirectionState(keyword, distance) {
-        const d = distance || "4%"
-        switch (keyword) {
-            case "bottom": return { opacity: 0, transform: { y: d } }
-            case "top": return { opacity: 0, transform: { y: -d } }
-            case "left": return { opacity: 0, transform: { x: -d } }
-            case "right": return { opacity: 0, transform: { x: d } }
-            default: return {}
-        }
-    }
-
-    /**
-     * 判断 entrance 是否启用。
-     * @param {Object|null} stateMeta
-     * @returns {boolean}
-     */
-    hasEnabledEntrance(stateMeta) {
-        return Boolean(stateMeta && stateMeta.entrance && stateMeta.entrance.enabled)
-    }
-
-    /**
-     * 判断 exit 是否启用。
-     * @param {Object|null} stateMeta
-     * @returns {boolean}
-     */
-    hasEnabledExit(stateMeta) {
-        return Boolean(stateMeta && stateMeta.exit && stateMeta.exit.enabled)
-    }
-
-    /**
-     * 仅当覆盖状态未定义 opacity 时，补充默认 opacity=0。
-     * @param {Object} overrides
-     * @returns {Object}
-     */
-    pickVisibleTransitionDefaults(overrides) {
-        if (
-            overrides &&
-            Object.prototype.hasOwnProperty.call(overrides, "opacity")
-        ) {
-            return {}
-        }
-
-        return {
-            opacity: 0,
-        }
-    }
-
-    /**
-     * 标记场景最终态缓存失效。
-     */
-    markResolvedCacheDirty() {
-        this.resolvedCacheDirty = true
-    }
-
-    /**
-     * 判断缓存是否过期。
-     * 触发条件：元素数量/场景数量变更，或场景状态版本号变化。
-     * @returns {boolean}
-     */
-    isResolvedCacheOutdated() {
-        if (this.resolvedCacheDirty) {
-            return true
-        }
-
-        if (this.cachedSceneCount !== this.scenes.length) {
-            return true
-        }
-
-        if (this.cachedElementCount !== this.elements.length) {
-            return true
-        }
-
-        for (const scene of this.scenes) {
-            const currentVersion =
-                scene && typeof scene.getStateVersion === "function"
-                    ? scene.getStateVersion()
-                    : 0
-            const snapshotVersion = this.sceneStateVersionSnapshot.get(scene)
-            if (snapshotVersion !== currentVersion) {
-                return true
-            }
-        }
-
-        return false
-    }
-
-    /**
-     * 确保场景最终态缓存可用。
-     */
-    ensureResolvedSceneCache() {
-        if (!this.isResolvedCacheOutdated()) {
-            return
-        }
-
-        this.rebuildResolvedSceneCache()
-    }
-
-    /**
-     * 重建场景最终态缓存。
-     * 规则：
-     * 1. 当前场景未声明元素时，继承上一场景最终态。
-     * 2. Scene.removeState(element) 会写入显式移除标记，阻断继承。
-     * 3. 当前场景 setState 会覆盖继承结果；meta 同步覆盖。
-     */
-    rebuildResolvedSceneCache() {
-        const cache = new Map()
-        let previousResolvedStates = new Map()
-        let previousResolvedMeta = new Map()
-
-        for (const scene of this.scenes) {
-            const resolvedStates = new Map()
-            const resolvedMeta = new Map()
-
-            for (const [elementId, prevState] of previousResolvedStates.entries()) {
-                resolvedStates.set(elementId, deepMerge({}, prevState))
-            }
-
-            for (const [elementId, prevMeta] of previousResolvedMeta.entries()) {
-                resolvedMeta.set(elementId, deepMerge({}, prevMeta))
-            }
-
-            for (const element of this.elements) {
-                const elementId = element.id
-                const isRemoved =
-                    scene && typeof scene.isStateRemoved === "function"
-                        ? scene.isStateRemoved(element)
-                        : false
-
-                if (isRemoved) {
-                    resolvedStates.delete(elementId)
-                    resolvedMeta.delete(elementId)
-                    continue
-                }
-
-                const explicitState = scene.getState(element)
-                if (!explicitState) {
-                    continue
-                }
-
-                resolvedStates.set(elementId, deepMerge({}, explicitState))
-
-                const explicitMeta = scene.getStateMeta(element)
-                resolvedMeta.set(elementId, deepMerge({}, explicitMeta || {}))
-            }
-
-            cache.set(scene, {
-                states: resolvedStates,
-                meta: resolvedMeta,
-            })
-
-            previousResolvedStates = resolvedStates
-            previousResolvedMeta = resolvedMeta
-
-            const stateVersion =
-                scene && typeof scene.getStateVersion === "function"
-                    ? scene.getStateVersion()
-                    : 0
-            this.sceneStateVersionSnapshot.set(scene, stateVersion)
-        }
-
-        this.resolvedSceneCache = cache
-        this.cachedSceneCount = this.scenes.length
-        this.cachedElementCount = this.elements.length
-        this.resolvedCacheDirty = false
+        this.program.ensureCompiled()
     }
 
     /**
@@ -1195,14 +1201,59 @@ export class Presentation {
             return null
         }
 
-        this.ensureResolvedSceneCache()
-        const sceneCache = this.resolvedSceneCache.get(scene)
-        if (!sceneCache) {
+        this.ensureProgramCompiled()
+        const index = this.program.getSceneIndex(scene)
+        const snapshot = this.program.getSnapshotByIndex(index)
+        if (!snapshot) {
             return null
         }
 
-        const state = sceneCache.states.get(element.id)
+        const state = snapshot.resolvedStatesById.get(element.id)
         return state ? deepMerge({}, state) : null
+    }
+
+    /**
+     * 获取可渲染状态（已应用布局编译缓存覆盖）。
+     * @param {Scene|null} scene
+     * @param {BaseElement} element
+     * @returns {Object|null}
+     */
+    getRenderableState(scene, element) {
+        if (!scene || !element || !element.id) {
+            return null
+        }
+
+        this.ensureProgramCompiled()
+        const index = this.program.getSceneIndex(scene)
+        const snapshot = this.program.getSnapshotByIndex(index)
+        if (!snapshot) {
+            return null
+        }
+
+        const state = snapshot.renderableStatesById.get(element.id)
+        return state ? deepMerge({}, state) : null
+    }
+
+    /**
+     * 获取元素在指定场景的编译布局。
+     * @param {Scene|null} scene
+     * @param {BaseElement} element
+     * @returns {Object|null}
+     */
+    getCompiledLayout(scene, element) {
+        if (!scene || !element || !element.id) {
+            return null
+        }
+
+        this.ensureProgramCompiled()
+        const index = this.program.getSceneIndex(scene)
+        const snapshot = this.program.getSnapshotByIndex(index)
+        if (!snapshot) {
+            return null
+        }
+
+        const layout = snapshot.compiledLayoutsById.get(element.id)
+        return layout ? deepMerge({}, layout) : null
     }
 
     /**
@@ -1216,13 +1267,108 @@ export class Presentation {
             return null
         }
 
-        this.ensureResolvedSceneCache()
-        const sceneCache = this.resolvedSceneCache.get(scene)
-        if (!sceneCache) {
+        this.ensureProgramCompiled()
+        const index = this.program.getSceneIndex(scene)
+        const snapshot = this.program.getSnapshotByIndex(index)
+        if (!snapshot) {
             return null
         }
 
-        const meta = sceneCache.meta.get(element.id)
+        const meta = snapshot.metaById.get(element.id)
         return meta ? deepMerge({}, meta) : null
+    }
+
+    /**
+     * 将 scene 引用解析为 sceneIndex。
+     * @param {number|string|any|null} sceneOrIndexOrName
+     * @returns {number}
+     */
+    resolveSceneIndex(sceneOrIndexOrName) {
+        if (sceneOrIndexOrName == null) {
+            return this.currentScene ? this.program.getSceneIndex(this.currentScene) : -1
+        }
+
+        if (typeof sceneOrIndexOrName === "number") {
+            const index = sceneOrIndexOrName
+            return Number.isInteger(index) ? index : -1
+        }
+
+        if (typeof sceneOrIndexOrName === "string") {
+            const name = sceneOrIndexOrName
+            const scene = this.scenes.find((s) => s && s.name === name) || null
+            return scene ? this.program.getSceneIndex(scene) : -1
+        }
+
+        // 尽量宽松地识别 Scene 实例：只要具备典型方法即可。
+        const maybeScene = sceneOrIndexOrName
+        if (maybeScene && typeof maybeScene.getState === "function" && typeof maybeScene.getStateMeta === "function") {
+            return this.program.getSceneIndex(maybeScene)
+        }
+
+        return -1
+    }
+
+    /**
+     * 获取指定场景的几何查询对象（纯计算预测，不依赖 DOM）。
+     *
+     * @param {number|string|any|null} sceneOrIndexOrName
+     * @param {Object} [options]
+     * @param {number} [options.containerWidth] - 画布宽（px）。用于“未渲染场景”的预测。
+     * @param {number} [options.containerHeight] - 画布高（px）。用于“未渲染场景”的预测。
+     * @param {boolean} [options.includeTransform=true]
+     * @returns {SceneGeometry|null}
+     */
+    getSceneGeometry(sceneOrIndexOrName, options = {}) {
+        this.ensureProgramCompiled()
+
+        const index = this.resolveSceneIndex(sceneOrIndexOrName)
+        const snapshot = this.program.getSnapshotByIndex(index)
+        if (!snapshot) {
+            return null
+        }
+
+        let containerWidth = Number(options.containerWidth || 0)
+        let containerHeight = Number(options.containerHeight || 0)
+
+        // 若调用方未显式提供尺寸，则尝试从当前 content 读取。
+        if (!(containerWidth > 0 && containerHeight > 0)) {
+            // 这里不强制 flush：几何预测 API 用于布局计算，调用方若依赖 DOM 尺寸，应在 start 后调用。
+            containerWidth = Number(this.content && this.content.clientWidth) || 0
+            containerHeight = Number(this.content && this.content.clientHeight) || 0
+        }
+
+        if (!(containerWidth > 0 && containerHeight > 0)) {
+            throw new Error(
+                "getSceneGeometry 需要有效的 containerWidth/containerHeight（用于未渲染场景预测），或确保 Presentation.start() 后再调用"
+            )
+        }
+
+        const elementsById = new Map(this.elements.map((el) => [el.id, el]))
+
+        return new SceneGeometry({
+            containerWidth,
+            containerHeight,
+            renderableStatesById: snapshot.renderableStatesById,
+            elementsById,
+            includeTransform: options.includeTransform !== false,
+        })
+    }
+
+    /**
+     * 直接获取元素在指定场景的矩形信息。
+     */
+    getElementRect(sceneOrIndexOrName, elementOrId, options = {}) {
+        const geometry = this.getSceneGeometry(sceneOrIndexOrName, options)
+        if (!geometry) return null
+        return geometry.getRect(elementOrId, options)
+    }
+
+    /**
+     * 直接获取元素在指定场景的九宫格点位（含可选偏移）。
+     */
+    getElementPoint(sceneOrIndexOrName, elementOrId, pos, options = {}) {
+        const geometry = this.getSceneGeometry(sceneOrIndexOrName, options)
+        if (!geometry) return null
+        return geometry.getPoint(elementOrId, pos, options)
     }
 }

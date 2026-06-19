@@ -1,18 +1,29 @@
 /**
- * 布局系统。
+ * @deprecated
+ * 这是旧版 DOM 渲染路径（Renderer/Layout）的布局解算器，仅用于兼容现有运行逻辑。
+ */
+
+/**
+ * Layout（布局解算器 / 纯计算）。
  *
- * 负责将 Element 的相对布局描述与 Scene 状态合并，
- * 计算绝对坐标并赋值到 Element.computed。
- * 
- * 职责：
- * - 解析百分比、相对单位、自动尺寸
- * - 处理父子尺寸约束与百分比继承
- * - 计算锚点影响下的实际坐标
- * 
- * 不做的事：
- * - 不处理动画插值（由 Renderer 负责）
- * - 不处理 DOM 更新（由 Renderer 负责）
- * - 不每帧运行（仅在状态切换时调用）
+ * Layout 的核心定位：
+ * - 将“相对布局描述（百分比/auto）”解算为“绝对像素坐标”，供 Renderer 输出到 DOM。
+ * - 自身保持纯计算：不触碰 DOM、不持有缓存、不做动画插值。
+ *
+ * 职责
+ * - 解析 left/top/width/height 等布局字段（百分比 → 像素）。
+ * - 处理最小必要的布局解算规则（本文件当前为最小实现）。
+ *
+ * 不做的事
+ * - 不做动画插值（由 Renderer/CSS transition 负责）。
+ * - 不写 DOM 样式（由 Renderer 负责）。
+ * - 不负责容器尺寸准备（由 Presentation.ensureContentRectReady 兜底）。
+ *
+ * 失败模式（常见症状）
+ * - containerWidth/Height 为 0 时，百分比换算退化为 0，导致 (0,0) 或尺寸为 0。
+ *
+ * 性能注意
+ * - 本模块本身无副作用；性能瓶颈通常来自调用方触发的 reflow 或遍历规模。
  */
 export class Layout {
     /**
