@@ -1,434 +1,82 @@
-﻿# SilkyScene
+# SilkyScene
 
-Scene-based motion presentation engine for the web.
-基于场景的 Web 动效演示引擎。
+SilkyScene 是一个以画布为基准、以稳定布局为首要目标的 Web 场景运行时。
 
----
+它希望解决的不是“怎样让 DOM 元素动起来”，而是另一件更靠前的事情：当文字、图片或其他素材被替换后，画面仍然保持原有构图，并在运行时得到确定、可供渲染和动画使用的几何结果。
 
-## Why SilkyScene? / 为什么做 SilkyScene？
+## 当前核心价值
 
-As a motion designer, After Effects user, and programming enthusiast, I've always been obsessed with spatial continuity in presentations.
+- 先定义画布，再定义元素。
+- 布局相对于画布，而不是相对于素材的天然尺寸。
+- 素材可以替换，但元素的锚点、位置与目标尺寸保持稳定。
+- 布局先被解算为确定的数值结果，DOM、SVG、Canvas 或其他后端只负责渲染。
+- 动画发生在已解算状态之间；动画由 SilkyScene 自己实现还是交给 GSAP，当前暂不决定。
 
-作为一名动效设计师 + After Effects 用户 + 编程爱好者，我一直对演示中的空间连续性有着近乎偏执的追求。
+SilkyScene 不是完整 CSS 布局系统，也不以复刻浏览器排版规则为目标。它更接近一套面向演示、动效与可替换内容的受控画布布局模型。
 
-When building animations in PowerPoint, I often relied heavily on Morph transitions and page-to-page object continuity to create smoother storytelling and cinematic motion.
+## 最小布局模型
 
-在 PowerPoint 中制作动画时，我大量依赖"平滑"切换和跨页对象连续性来实现更流畅的叙事与电影感动效。
-
-But over time, I realized something frustrating:
-
-但随着时间推移，我意识到一个令人沮丧的问题：
-
-**In traditional slide-based tools, animated objects don't truly persist between slides.**
-
-**在传统幻灯片工具中，动画对象并不能真正跨页持续存在。**
-
-To animate a single element, you often need to duplicate it across multiple pages, manually adjust positions, and maintain consistency yourself. This workflow becomes increasingly difficult as projects grow.
-
-要为一个元素制作动画，往往需要在多个页面中复制它，手动调整位置，并自行维护一致性。随着项目规模增长，这种工作流程变得越来越难以维护。
-
-SilkyScene started as an attempt to rethink presentations from a scene-based perspective rather than a slide-based one.
-
-SilkyScene 最初是一次尝试——从**场景视角**而非幻灯片视角重新思考演示文稿。
-
-Instead of treating presentations as isolated pages, SilkyScene explores the idea of:
-
-与其将演示视为孤立的页面集合，SilkyScene 探索的是：
-
-- persistent objects / **持久化对象**
-- spatial continuity / **空间连续性**
-- timeline-driven transitions / **时间轴驱动的过渡**
-- motion-oriented storytelling / **以动效为核心的叙事**
-- scene graphs for presentations / **演示场景图**
-
-I want to break out of the HTML PPT paradigm and explore a motion-native presentation runtime for the web.
-
-我想跳出 HTML PPT 的框架，探索一种面向 Web 的、以动效为原生范式的演示运行时。
-
----
-
-## Vision / 愿景
-
-SilkyScene is currently an experimental project exploring:
-
-SilkyScene 目前是一个实验性项目，正在探索以下方向：
-
-- Scene systems / 场景系统
-- Motion transitions / 动效过渡
-- Timeline control / 时间轴控制
-- Camera movement / 镜头运动
-- Persistent objects / 持久化对象
-- Web-based presentation runtime / 基于 Web 的演示运行时
-
-In the future, it may evolve into a full presentation engine, or remain a proof-of-concept. Either way, I hope it sparks new thinking about what presentations can be.
-
-未来它可能发展成为一个完整的演示引擎，也可能只是一个概念验证项目。无论如何，我希望它能激发人们对演示新可能性的思考。
-
----
-
-## Installation / 安装
-
-```bash
-npm install @silkysite/scene
-```
-
----
-
-## v2.0 Breaking Changes / v2.0 重大变更
-
-**⚠️ v2.0.0-alpha introduces breaking changes for improved developer experience.**
-
-**⚠️ v2.0.0-alpha 引入了重大变更，旨在提升开发体验。**
-
-### 1. Incremental State Writing / 增量状态写入
-
-`scene.setState()` now **merges state by default** instead of replacing it entirely.
-
-`scene.setState()` 现在默认**增量合并状态**，而非完全替换。
-
-```javascript
-// v1.x - Full state replacement (old behavior)
-scene1.setState(element, { layout: {...}, opacity: 1, text: {...} })
-scene2.setState(element, { layout: {...}, opacity: 1, text: {...} }) // All duplicated!
-
-// v2.0 - Incremental state (new behavior)
-scene1.setState(element, { layout: {...}, opacity: 1, text: {...} })
-scene2.setState(element, { text: { color: "red" } }) // Only write what changes!
-// Scene2 inherits layout and opacity from scene1
-```
-
-**If you need full replacement**, use `scene.replaceState()`:
-
-**如需完全替换**，使用 `scene.replaceState()`：
-
-```javascript
-scene.replaceState(element, { opacity: 0 }) // Clears all previous state
-```
-
-### 2. Default Layout Mode Changed / 默认布局模式变更
-
-Default `layout.mode` changed from `"relative"` to `"absolute"`.
-
-默认 `layout.mode` 从 `"relative"` 改为 `"absolute"`。
-
-```javascript
-// v1.x - Must specify mode every time
-setState(element, { layout: { mode: "absolute", left: "10%", ... }})
-
-// v2.0 - Absolute is default
-setState(element, { layout: { left: "10%", top: "20%" }}) // mode defaults to "absolute"
-```
-
-### 3. Flow Layout Compilation / 流式布局编译
-
-New natural language layout system with automatic compilation to absolute positions.
-
-新增自然语言布局系统，自动编译为绝对定位。
-
-```javascript
-// Natural language layout (compiled at startup)
-scene.setState(container, {
-    layout: {
-        mode: "absolute",
-        left: "10%", top: "10%",
-        width: "80%", height: "80%",
-        flow: "row",      // or "column"
-        gap: "2%",        // spacing between children
-        align: "center",  // start | center | end
-        justify: "start"  // start | center | end
-    }
-})
-
-// Child elements automatically positioned within parent flow
-```
-
-### 4. Parent Binding / 父子绑定
-
-Scene-level parent binding for dynamic layout relationships.
-
-场景级父子绑定，支持动态布局关系。
-
-```javascript
-scene.setState(child, state, {
-    parent: {
-        enabled: true,
-        targetId: parent.id
-    }
-})
-// Child inherits parent's flow layout rules
-```
-
-### 5. Import/Export Support / 导入导出支持
-
-New `SceneIO` API for serializing and deserializing presentations.
-
-新增 `SceneIO` API，支持演示工程的序列化与反序列化。
-
-```javascript
-import { SceneIO } from "@silkysite/scene"
-
-// Export presentation to JSON
-const json = SceneIO.exportSource(presentation)
-
-// Import from JSON
-const restored = SceneIO.importSource(container, json)
-```
-
-See [Migration Guide](#migration-guide) for detailed upgrade instructions.
-
-详见[迁移指南](#migration-guide)了解升级详情。
-
----
-
-## Architecture / 架构速览
-
-SilkyScene separates **semantic planning** from **render execution**.
-
-SilkyScene 把“动画语义规划”和“渲染执行”拆成两层，避免语义与 DOM 逻辑耦在一起。
-
-- **Scene**：State table / 状态输入表
-  - Stores element states + metadata (entrance/exit/delayPattern/tombstone).
-  - 只存“元素在该场景应如何表现”的状态与元数据，不持有 DOM。
-
-- **Presentation**：Orchestrator / 编排器
-  - Maintains resolved cache (inheritance + tombstone), resolves transition config.
-  - On scene change, generates a **transitionPlan (SceneChangePlan)** and passes it to Renderer.
-  - 切场景时会生成 `transitionPlan`（纯数据的“切场景执行计划”），把方向、from/to、delay 镜像等语义计算集中在这里。
-
-- **Renderer**：Executor / 执行器
-  - Consumes `transitionPlan` and writes DOM styles (delay/from/to).
-  - Uses the two-frame entrance mechanism to reliably trigger CSS transitions.
-  - 只负责按计划写 DOM，并执行两帧入场（见机制文档）。
-
-If you only use `presentation.setScene(...)`, you normally don't need to care about `transitionPlan`.
-
-如果你只通过 `presentation.setScene(...)` 切场景，通常不需要关心 `transitionPlan`；它主要用于引擎内部的“语义 → 执行”边界，或自定义渲染后端时的接入点。
-
-Docs:
-- `docs/运行时对象与状态模型.md`
-- `docs/两帧渲染机制.md`
-- `docs/架构演进/scene-v2-思维模型与实现路线.md`
-
----
-
-## Quick Start / 快速开始
-
-```javascript
-import { Presentation, Scene, TextElement } from "@silkysite/scene"
-
-const presentation = new Presentation("#container")
-
-const title = new TextElement({
-    text: "Hello SilkyScene",
-    layout: { left: "50%", top: "50%" }
-})
-presentation.addElement(title)
-
-const scene1 = new Scene("intro")
-scene1.setState(title, { opacity: 0 })
-presentation.addScene(scene1)
-
-const scene2 = new Scene("show")
-```
----
-
-## Batch & Factories / 批量与模板
-
-当场景较大时，重复的 `new ...`、`presentation.addElement(...)`、`scene.setState(...)` 会变得冗长。
-v2 在保持原有 API 不变的前提下，提供了一组可选的“批量与模板”能力，用于减少样板代码。
-
-### 1) 批量添加元素
+画布拥有明确的设计比例，例如 `16:9` 或 `9:16`。元素通过百分比描述相对于画布的位置和尺寸。
 
 ```js
-presentation.addElements([title, subtitle, box])
-```
-
-### 2) 批量创建并注册元素（支持 name 注册表）
-
-```js
-const registry = presentation.createElements([
-  { type: "text", name: "title", options: { text: "Hello", fontSize: "8%" } },
-  { type: "shape", name: "panel", options: { shapeType: "rect", fill: "#111" } },
-])
-
-// registry.byName.get("title") / registry.byName.get("panel")
-```
-
-### 3) 按 name 查找
-
-```js
-const title = presentation.getElementByName("title")
-const allTitles = presentation.getElementByName("title", { multiple: true })
-```
-
-### 4) 批量写入状态（顺序稳定，兼容 delayPattern:'auto'）
-
-```js
-scene.setDelayPattern("auto", { interval: 100 })
-
-scene.setStates([
-  { element: title, state: { opacity: 1 } },
-  { element: subtitle, state: { opacity: 1 } },
-  { element: panel, state: { opacity: 1 } },
-])
-```
-
-> 说明：`setStates` 使用数组 entries，保证写入顺序稳定；因此 auto delay 会严格按 entries 顺序递增。
-
-### 5) “同款文字”工厂（样式模板）
-
-```js
-const Title = presentation.createTextFactory({
-  fontSize: "8%",
-  color: "#fff",
-  textAlign: "center",
-  lineHeight: 1.2,
-})
-
-const t1 = Title({ text: "封面标题" })
-const t2 = Title({ text: "第二行标题", fontSize: "6%" }) // 允许覆写
-
-```
-
-默认情况下，工厂创建的元素会自动 `addElement` 注册（可传 `{ autoAdd: false }` 关闭）。
-
-```
-scene2.setState(title, { opacity: 1 }) // Inherits layout from scene1!
-presentation.addScene(scene2)
-
-presentation.mountContent().bindRenderer().goToScene(0)
-```
-
----
-
-## SceneIO - Import/Export / 场景导入导出
-
-`SceneIO` provides source-level JSON serialization for presentations.
-
-`SceneIO` 为演示工程提供源码级 JSON 序列化能力。
-
-### Export / 导出
-
-```javascript
-import { SceneIO } from "@silkysite/scene"
-
-const json = SceneIO.exportSource(presentation)
-console.log(JSON.stringify(json, null, 2))
-
-// Save to file or version control
-localStorage.setItem("myPresentation", JSON.stringify(json))
-```
-
-### Import / 导入
-
-```javascript
-const json = JSON.parse(localStorage.getItem("myPresentation"))
-const presentation = SceneIO.importSource("#container", json)
-
-presentation.bindRenderer().goToScene(0)
-```
-
-### JSON Structure / JSON 结构
-
-```json
-{
-  "schemaVersion": "2.0.0-alpha",
-  "kind": "@silkysite/scene-source",
-  "presentation": {
-    "options": { ... }
+const title = {
+  type: "text",
+  content: "SilkyScene",
+  layout: {
+    anchor: [0, 0],
+    left: "10%",
+    top: "10%",
+    width: "30%",
   },
-  "elements": [
-    {
-      "ref": "e1",
-      "type": "text",
-      "options": { "text": "Hello", ... }
-    }
-  ],
-  "scenes": [
-    {
-      "name": "scene1",
-      "transition": { "duration": 500 },
-      "states": {
-        "e1": {
-          "state": { "opacity": 1 },
-          "meta": { "entrance": true }
-        }
-      },
-      "removed": []
-    }
-  ]
 }
 ```
 
-### Minimal Example / 最小可用示例
+这段定义表示：
 
-```javascript
-import { Presentation, Scene, TextElement, SceneIO } from "@silkysite/scene"
+- `anchor: [0, 0]` 使用元素自身左上角作为定位参考点。
+- `left: "10%"` 将该参考点放在画布宽度的 10% 处。
+- `top: "10%"` 将该参考点放在画布高度的 10% 处。
+- `width: "30%"` 将元素目标宽度设为画布宽度的 30%。
 
-// Create a simple presentation
-const presentation = new Presentation("#container")
+在默认的等比尺寸模式中，只允许声明 `width` 或 `height` 其中一个值，另一个值由素材的解算结果按比例得到。文字的多行排版、换行和溢出策略仍待单独定义。
 
-const text = new TextElement({ text: "Export Me" })
-presentation.addElement(text)
+## 响应式画布
 
-const scene = new Scene("main")
-scene.setState(text, {
-    layout: { left: "50%", top: "50%" },
-    opacity: 1
-})
-presentation.addScene(scene)
+SilkyScene 的响应式首先针对画布，而不是直接针对浏览器视口中的零散 DOM 节点。
 
-presentation.mountContent().bindRenderer().goToScene(0)
+同一个场景可以为不同画布条件提供布局配置，例如：
 
-// Export to JSON
-const json = SceneIO.exportSource(presentation)
-console.log(json)
+- `16:9` 横向画布布局
+- `9:16` 纵向画布布局
+- 极宽或极高画布的补充变体
+- 必要时按画布实际宽高设置条件
 
-// Re-import in another project
-const cloned = SceneIO.importSource("#another-container", json)
-cloned.bindRenderer().goToScene(0)
+当前推荐优先使用画布比例选择布局变体。宿主区域的像素宽高用于决定画布如何缩放和放置，不直接改变场景的设计坐标语义。
+
+## 处理流程
+
+```text
+Canvas Definition
+        ↓
+Responsive Layout Selection
+        ↓
+Element Layout Resolve
+        ↓
+Resolved Scene（确定的矩形、锚点与变换）
+        ↓
+Render Backend
+        ↓
+Motion Backend（以后决定自研或 GSAP）
 ```
 
----
+布局系统是 SilkyScene 当前重写阶段的第一优先级。DOM 渲染、时间轴、过渡动画和动画库选型都位于它之后。
 
-## Migration Guide / 迁移指南
+## 当前状态
 
-### From v1.x to v2.0 / 从 v1.x 迁移到 v2.0
+这个仓库保留了上一阶段的源码和文档，便于后续整理与取舍；它们暂不代表本轮重写的现行设计契约。
 
-1. **Review all `setState()` calls**  
-   检查所有 `setState()` 调用
-   - Remove redundant state declarations across scenes
-   - 删除跨场景的冗余状态声明
-   - Use `replaceState()` if you need full replacement
-   - 如需完全替换，使用 `replaceState()`
+当前设计基线见 [画布与稳定布局](./docs/00-当前设计基线-画布与稳定布局.md)。在布局模型得到验证之前，不以旧 API 兼容、旧动画机制或旧文档为本轮重写目标。
 
-2. **Update layout mode defaults**  
-   更新布局模式默认值
-   - Remove explicit `mode: "absolute"` declarations
-   - 移除显式的 `mode: "absolute"` 声明
-   - Add `mode: "relative"` if you relied on relative positioning
-   - 若依赖相对定位，添加 `mode: "relative"`
-
-3. **Test scene transitions**  
-   测试场景切换
-   - Verify state inheritance works as expected
-   - 验证状态继承符合预期
-   - Check for unintended state leakage
-   - 检查意外的状态泄漏
-
----
-
-## Docs / 文档
-
-- `docs/运行时对象与状态模型.md`：对象模型、场景继承、响应式尺寸规范
-- `docs/场景入场语法糖提案.md`：entrance/exit/direction 语义与 distance 规则
-- `docs/两帧渲染机制.md`：入场动画两帧执行流程
-- `docs/LineElement与ArrowElement设计.md`：纯 DOM 线段与组合箭头设计
-- `docs/ShapeElement设计与矩形实现.md`：rect/circle 图形、描边、圆角与场景状态设计
-- `docs/架构演进/scene-v2-思维模型与实现路线.md`：v2.0 架构设计文档
-
----
-
-## License / 许可证
+## License
 
 MIT

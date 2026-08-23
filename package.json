@@ -1,7 +1,7 @@
 {
   "name": "@silkysite/scene",
   "version": "0.0.1",
-  "description": "Scene-based motion presentation engine for the web",
+  "description": "Canvas-first layout runtime for stable web presentations",
   "main": "index.js",
   "license": "MIT",
   "author": "Zion Rao <Zion@silky.site>",
@@ -12,11 +12,11 @@
   },
   "keywords": [
     "scene",
-    "motion",
+    "layout",
+    "canvas",
     "presentation",
-    "animation",
-    "timeline",
-    "transition"
+    "responsive",
+    "composition"
   ],
   "type": "module",
   "scripts": {
