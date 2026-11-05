@@ -141,3 +141,17 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Project-local files managed by external sync and backup
+/_storage/*
+!/_storage/README.md
+
+# Local fonts for previews (not committed; see docs/05)
+playground/assets/fonts/
+
+# Local-only assets (not committed)
+playground/assets/private/
+playground/assets/gen/
+
+# Exported videos
+exports/

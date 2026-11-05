@@ -1,8 +1,21 @@
 {
   "name": "@silkysite/scene",
-  "version": "0.0.1",
-  "description": "Canvas-first layout runtime for stable web presentations",
-  "main": "index.js",
+  "version": "0.1.0",
+  "description": "Canvas-first scene layout with a deterministic motion engine: present scenes live step by step in the browser, or export them frame-exact to MP4.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "license": "MIT",
   "author": "Zion Rao <Zion@silky.site>",
   "homepage": "https://github.com/sakamoto-king/silkyscene",
@@ -15,11 +28,32 @@
     "layout",
     "canvas",
     "presentation",
-    "responsive",
-    "composition"
+    "slides",
+    "motion",
+    "animation",
+    "camera",
+    "video",
+    "mp4",
+    "deterministic"
   ],
-  "type": "module",
   "scripts": {
-    "test": "node __tests__/scene-v2.test.js"
+    "dev": "vite --open /playground/inspector.html --host 127.0.0.1 --port 5311 --strictPort",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint:scene": "npm run build && node tools/lint_scene.mjs --warn-only",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "export:mp4": "node tools/export_mp4.mjs",
+    "examples": "npm run build && node playground/examples/gen_examples.mjs",
+    "check": "npm run build && node tools/check_scene.mjs topology-flow scale-matrix canvas-handoff",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite": "^6.4.3"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
   }
 }
