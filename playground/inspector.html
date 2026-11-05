@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SilkyScene · 后台检查器</title>
+<link rel="stylesheet" href="./inspector.css">
+</head>
+<body>
+<div class="app" data-left="on" data-right="on">
+  <div class="lint-pop" id="lintPop" hidden role="dialog" aria-label="逐帧轨迹警告"></div>
+  <header class="top">
+    <div class="logo">S</div><div class="brand">SilkyScene</div>
+    <div class="crumb" id="crumb">检查器</div>
+    <div class="spacer"></div>
+    <span class="pill note" id="heavyNote" hidden title="元素或节点很多的场景，首次打开先收起两侧栏；点「左栏」「右栏」随时打开，会记住你的选择">重场景已收起侧栏，可随时点开</span>
+    <button class="pill amber" id="lintBadge" type="button" hidden aria-expanded="false" title="点开查看哪些元素的哪条属性是逐帧采样（docs/02）">⚠ 逐帧轨迹警告</button>
+    <div class="seg" role="group" aria-label="侧栏开关"><button id="toggleLeft" aria-pressed="true" title="左侧元素栏（场景结构）">左栏</button><button id="toggleRight" aria-pressed="true" title="右侧属性栏">右栏</button></div>
+    <button class="btn" id="focusCanvas" title="一键收起 / 展开两侧栏">专注画布</button>
+    <span class="pill" id="solveStatus" role="status"><span class="dot"></span><span>正在解算</span></span>
+    <a class="btn primary" id="present" href="./present.html" target="_blank" rel="noopener" title="新标签打开现场步进演示（present.html）">现场演示 ↗</a><button class="btn" id="copyFrame">复制本帧数据</button><button class="btn" id="exportDoc">导出 JSON</button><div class="seg" role="group" aria-label="检查器模式"><button id="inspectMode" aria-pressed="true">检查</button><button id="editMode" aria-pressed="false" title="v1 仅数值回写">编辑</button></div>
+  </header>
+
+  <aside class="panel tree">
+    <div class="phead"><span class="t">场景结构</span><span class="eyebrow">Paint order</span></div>
+    <div class="pbody" id="tree"></div>
+    <div class="rsz rsz-col" id="rszLeft" role="separator" aria-orientation="vertical" aria-label="调整左侧栏宽度" tabindex="0" title="拖拽调整宽度 · 双击恢复默认"></div>
+  </aside>
+
+  <main class="stage">
+    <div class="stagebar">
+      <span class="eyebrow">世界总览</span>
+      <div class="seg" id="layers">
+        <button aria-pressed="true" data-l="grid">网格</button><button aria-pressed="true" data-l="regions">区域</button><button aria-pressed="true" data-l="anchors">锚点</button><button aria-pressed="true" data-l="path">摄像机轨迹</button><button aria-pressed="true" data-l="nulls">空对象</button><button aria-pressed="true" data-l="arcs">弧线</button><button aria-pressed="true" data-l="camArcs">摄像机弧线</button>
+      </div>
+      <div class="legend"><span><i style="border-color:var(--region);border-top-style:dashed"></i>区域</span><span><i style="border-color:var(--sel)"></i>选中</span><span><i style="border-color:var(--camera)"></i>取景框 / 取景中心 / 取景轨迹</span><span><i style="border-color:var(--look)"></i>目标点</span></div>
+      <div class="spacer"></div>
+      <button class="btn" id="fit">适应全部</button>
+      <span class="mono" style="font-size:11px;color:var(--muted)" id="zoomLabel">100%</span>
+    </div>
+    <div class="views">
+      <svg id="world"></svg>
+      <div class="stamp">解算数据 · renderAt(t)</div>
+      <div class="coord" id="coord">world —</div>
+      <div class="pip">
+        <div class="phead"><span class="t">摄像机画面</span><span class="eyebrow">1920 × 1080 · 成片</span></div>
+        <div id="cam" role="img" aria-label="摄像机画面"></div>
+      </div>
+    </div>
+  </main>
+
+  <aside class="panel insp">
+    <div class="rsz rsz-col rsz-leftish" id="rszRight" role="separator" aria-orientation="vertical" aria-label="调整右侧栏宽度" tabindex="0" title="拖拽调整宽度 · 双击恢复默认"></div>
+    <div class="phead"><span class="t">属性</span><span class="eyebrow">Inspector</span></div>
+    <div class="pbody">
+      <div class="sec" id="camSec"></div>
+      <div class="sec" id="elSec"></div>
+    </div>
+  </aside>
+
+  <section class="tl">
+    <div class="rsz rsz-row" id="rszBottom" role="separator" aria-orientation="horizontal" aria-label="调整时间轴高度" tabindex="0" title="拖拽调整高度 · 双击恢复默认"></div>
+    <div class="transport">
+      <button class="btn" id="prev">‹ 帧</button>
+      <button class="btn primary" id="play">播放</button>
+      <button class="btn" id="next">帧 ›</button>
+      <div class="clock" id="clock">0.00<small> s</small></div>
+      <span class="mono" style="font-size:12px;color:var(--ink-2)" id="frameNo">F 0 / 270</span>
+      <span class="mono" style="font-size:12px;color:var(--muted)" id="srcClock"></span>
+      <span class="edit-only" id="bindBar"><button class="btn" id="bindGroup" title="把选中的关键帧（Shift+点击多选）绑定为一组，拖动时同步平移">绑定为组</button><button class="btn" id="unbindGroup" title="解除选中关键帧的绑定（含自动绑定）">解除绑定</button><button class="btn" id="exportTiming" title="导出拖动后的时间表 -timing.json">导出时间表</button><span class="mono" id="bindInfo" style="font-size:11px;color:var(--muted)"></span></span>
+      <div class="spacer"></div>
+      <span class="eyebrow">轨道</span>
+      <div class="seg" id="tlMode" role="group" aria-label="时间轴显示哪些轨道"><button data-m="camera" aria-pressed="true" title="只显示摄像机与目标点的轨道（默认，重场景不卡）">仅摄像机</button><button data-m="selected" aria-pressed="false" title="摄像机 + 当前选中元素的轨道">选中元素</button><button data-m="all" aria-pressed="false" title="所有元素的所有轨道（重场景会很慢）">全部轨道</button></div>
+      <span class="mono" id="tlCount" style="font-size:11px;color:var(--muted)"></span>
+      <span class="eyebrow">跳转</span>
+      <div class="seg" id="keys"></div>
+    </div>
+    <div class="tracks" id="tracks"><div class="tnames" id="tnames"></div><div class="tlanes" id="tlanes"></div></div>
+  </section>
+</div>
+
+<script type="module" src="./inspector.ts"></script>
+</body>
+</html>
