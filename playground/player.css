@@ -1,0 +1,9 @@
+/* docs/06 帧播放页：纯舞台，字体与检查器一致（同一份 _storage/inspector-fonts，缺失时回落系统字体）。 */
+@font-face{font-family:"Host Grotesk";src:url("../_storage/inspector-fonts/HostGrotesk-Bold.ttf") format("truetype");font-weight:700;font-display:block}
+@font-face{font-family:"Instrument Sans";src:url("../_storage/inspector-fonts/InstrumentSans-VF.ttf") format("truetype");font-weight:400 700;font-display:block}
+@font-face{font-family:"Geist Mono";src:url("../_storage/inspector-fonts/GeistMono-VF.ttf") format("truetype");font-weight:100 900;font-display:block}
+@font-face{font-family:"Noto Sans SC";src:url("../_storage/inspector-fonts/NotoSansSC-VF.ttf") format("truetype");font-weight:100 900;font-display:block}
+html,body{margin:0;padding:0;width:100vw;height:100vh;overflow:hidden;background:#000}
+body{display:flex;align-items:center;justify-content:center;font-synthesis:none;-webkit-font-smoothing:antialiased}
+#stage{position:relative;overflow:hidden;flex:none}
+#player-error{position:fixed;inset:auto 16px 16px 16px;margin:0;padding:10px 14px;background:#fff1ee;color:#b42318;font:14px/1.5 system-ui,sans-serif;border:1px solid #f3b8ad;white-space:pre-wrap}

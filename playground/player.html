@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>SilkyScene · 帧播放页</title>
+<link rel="stylesheet" href="./player.css">
+</head>
+<body>
+<!-- docs/06：无 UI 外壳的全画幅帧页。?doc=<slug> 读取 ./<slug>.scene.json + 可选 ./<slug>-timing.json。
+     tools/export_mp4.mjs 与 HyperFrames 捕获（window.__hf）都驱动这一页。 -->
+<div id="stage" data-composition-id="silkyscene" aria-label="SilkyScene 画面"></div>
+<p id="player-error" hidden></p>
+<script type="module" src="./player.ts"></script>
+</body>
+</html>
