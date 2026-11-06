@@ -9,11 +9,12 @@ import { easeLabel } from "./inspector-ease.js"
 const params = new URL(location.href).searchParams
 /** 官方样片（默认打开第 1 支）；其它任意 ?doc=<name> 也能打开，总帧数按最后一个节点推算。 */
 const EXAMPLES: Record<string, { label: string; select: string }> = {
+  "spatial-stage": { label: "空间舞台 · 3D 双节点透视", select: "core" },
   "topology-flow": { label: "清单到拓扑 · 依赖重排", select: "root" },
   "scale-matrix": { label: "微距到全局 · 尺度矩阵", select: "matrix" },
   "canvas-handoff": { label: "节点协作 · 跨层微交互", select: "btn" },
 }
-const rawDoc = params.get("doc")?.trim() || "topology-flow"
+const rawDoc = params.get("doc")?.trim() || "spatial-stage"
 if (!/^[a-zA-Z0-9_.-]+$/.test(rawDoc)) throw new Error("?doc= 只接受文件名（字母数字 _ - .）")
 const config = { name: rawDoc, label: EXAMPLES[rawDoc]?.label ?? rawDoc, select: EXAMPLES[rawDoc]?.select ?? "camera" }
 /** 跳转按钮：时间表里的演示步点（steps → segments → 锚点），载入后填充。 */

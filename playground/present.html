@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SilkyScene · 现场演示</title>
+<link rel="stylesheet" href="./present.css">
+</head>
+<body>
+<div id="progress" aria-hidden="true"><i></i></div>
+<div id="stage" role="img" aria-label="演示画面"></div>
+<nav id="deck-hud" aria-label="演示控制">
+  <span id="deck-count" class="num">01 / 01</span>
+  <span id="deck-title"></span>
+  <span id="deck-dots" aria-hidden="true"></span>
+  <button id="deck-prev" type="button" title="上一步（← / ↑ / PageUp）" aria-label="上一步">‹</button>
+  <button id="deck-next" type="button" title="下一步（空格 / → / ↓ / PageDown）" aria-label="下一步">›</button>
+  <button id="deck-full" type="button" title="全屏（F）" aria-label="全屏">⛶</button>
+</nav>
+<p id="present-error" hidden></p>
+<script type="module" src="./present.ts"></script>
+</body>
+</html>

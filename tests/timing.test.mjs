@@ -47,10 +47,10 @@ test('sceneDuration takes the latest cue end, segment end or anchor', () => {
   assert.equal(sceneDuration({ cues: [{ at: 'a', duration: 1.5 }] }, new Map([['a', 2]])), 3.5)
 })
 
-test('the three official examples pass check_scene --strict (0 lint, 0 quality warnings)', () => {
-  const r = spawnSync(process.execPath, ['tools/check_scene.mjs', '--strict', 'topology-flow', 'scale-matrix', 'canvas-handoff'], { cwd: new URL('..', import.meta.url), encoding: 'utf8' })
+test('the four official examples pass check_scene --strict (0 lint, 0 quality warnings)', () => {
+  const r = spawnSync(process.execPath, ['tools/check_scene.mjs', '--strict', 'spatial-stage', 'topology-flow', 'scale-matrix', 'canvas-handoff'], { cwd: new URL('..', import.meta.url), encoding: 'utf8' })
   assert.equal(r.status, 0, r.stderr)
-  for (const name of ['topology-flow', 'scale-matrix', 'canvas-handoff']) assert.match(r.stdout, new RegExp('✔ ' + name + '.*0 逐帧警告, 0 质量警告'))
+  for (const name of ['spatial-stage', 'topology-flow', 'scale-matrix', 'canvas-handoff']) assert.match(r.stdout, new RegExp('✔ ' + name + '.*0 逐帧警告, 0 质量警告'))
 })
 
 test('player page exposes the __silkyPlayer and HyperFrames (__hf) frame protocol', () => {

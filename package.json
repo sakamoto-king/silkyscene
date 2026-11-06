@@ -45,7 +45,7 @@
     "test": "npm run build && node --test tests/*.test.mjs",
     "export:mp4": "node tools/export_mp4.mjs",
     "examples": "npm run build && node playground/examples/gen_examples.mjs",
-    "check": "npm run build && node tools/check_scene.mjs topology-flow scale-matrix canvas-handoff",
+    "check": "npm run build && node tools/check_scene.mjs spatial-stage topology-flow scale-matrix canvas-handoff",
     "prepack": "npm run build"
   },
   "devDependencies": {
